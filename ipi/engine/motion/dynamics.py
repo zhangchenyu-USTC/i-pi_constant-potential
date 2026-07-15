@@ -20,7 +20,7 @@ from ipi.engine.thermostats import Thermostat
 from ipi.engine.barostats import Barostat, BaroRGB
 from ipi.utils.messages import warning, verbosity
 from ipi.utils.units import Constants
-from ipi.engine.constant_potential import finite_values, mean_extra
+from ipi.engine.constant_potential import finite_values
 
 
 class Dynamics(Motion):

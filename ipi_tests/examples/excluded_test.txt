@@ -21,3 +21,13 @@ features/metadynamics/pimd_metadynamics_zundel
 features/metadynamics/remd_metadynamics_zundel
 features/metadynamics/wte_metadynamics_zundel
 features/metadynamics/opes_metadynamics_zundel
+
+# Require patched first-principles clients that implement CHGDATA and return
+# real constant-potential extras; the generic dummy-driver smoke test cannot
+# exercise these examples. The analytic 1-pes-fermi example remains enabled.
+constant_potential/2-vasp-implicit
+constant_potential/3-vasp-Ne
+constant_potential/4-cp2k-implicit-mixing
+constant_potential/5-cp2k-Ne
+constant_potential/6-abacus-pw-implicit
+constant_potential/7-abacus-lcao-implicit

@@ -38,10 +38,3 @@ jobs:
 
       - name: unit tests
         run: tox -e unit -- --cov=ipi --cov-report=xml:coverage-unit.xml --cov-report=term ipi_tests/unit_tests
-
-      - name: upload coverage
-        uses: codecov/codecov-action@v7
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage-unit.xml
-          fail_ci_if_error: true

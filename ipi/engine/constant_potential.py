@@ -168,12 +168,8 @@ class ConstantPotentialSocketMixin:
                 raise ValueError("Invalid workfunction potential_average_axis.")
             minimum, maximum = self._workfunction_region_A()
             pars = append_init_token(pars, "potential_average_axis", axis)
-            pars = append_init_token(
-                pars, "potential_average_min_A", f"{minimum:.16g}"
-            )
-            pars = append_init_token(
-                pars, "potential_average_max_A", f"{maximum:.16g}"
-            )
+            pars = append_init_token(pars, "potential_average_min_A", f"{minimum:.16g}")
+            pars = append_init_token(pars, "potential_average_max_A", f"{maximum:.16g}")
         request["pars"] = pars
         request["nelect"] = float(self.current_nelect)
         request["mode_flags"] = int(self._mode_flags())

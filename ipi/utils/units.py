@@ -34,7 +34,10 @@ class Constants(object):
     amu = 1822.8885
     e = 1.0  # elementary charge, electron charge = - |e|
 
-    EV_PER_HARTREE = 27.211386245988
+    # Keep the upstream i-PI electronvolt conversion exactly.  Constant-
+    # potential code uses the reciprocal helper, while ordinary i-PI output
+    # must remain numerically identical to the upstream 3.3.0 behavior.
+    EV_PER_HARTREE = 1.0 / 0.036749326
 
 
 class Elements(dict):
