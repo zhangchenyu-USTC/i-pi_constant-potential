@@ -1,0 +1,1330 @@
+diff --git a/src/ipi_driver.F b/src/ipi_driver.F
+index fe45320..3a5707a 100644
+--- a/src/ipi_driver.F
++++ b/src/ipi_driver.F
+@@ -10,6 +10,7 @@
+ !> \par History
+ !>      none
+ !> \author Michele Ceriotti 03.2012
++!> \note Modified to support i-PI constant-potential CHGDATA and extras JSON output
+ ! **************************************************************************************************
+ MODULE ipi_driver
+    USE ISO_C_BINDING, ONLY: C_CHAR, &
+@@ -18,15 +19,20 @@ MODULE ipi_driver
+                             C_LOC, &
+                             C_NULL_CHAR, &
+                             C_PTR
++   USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY: IEEE_IS_FINITE
+    USE bibliography, ONLY: Ceriotti2014, &
+                            Kapil2016, &
+                            cite_reference
+    USE cell_methods, ONLY: cell_create, &
+                            init_cell
+    USE cell_types, ONLY: cell_release, &
+-                         cell_type
++                         cell_type, &
++                         get_cell
+    USE cp_external_control, ONLY: external_control
+    USE cp_log_handling, ONLY: cp_logger_get_default_io_unit
++   USE cp_control_types, ONLY: dft_control_type
++   USE cp_dbcsr_api, ONLY: dbcsr_p_type
++   USE cp_fm_types, ONLY: cp_fm_type
+    USE cp_subsys_types, ONLY: cp_subsys_get, &
+                               cp_subsys_set, &
+                               cp_subsys_type
+@@ -44,6 +50,27 @@ MODULE ipi_driver
+    USE message_passing, ONLY: mp_para_env_type, &
+                               mp_request_type, &
+                               mp_testany
++   USE qs_environment_types, ONLY: get_qs_env, &
++                                   qs_environment_type
++   USE qs_kind_types, ONLY: qs_kind_type, &
++                            get_qs_kind, &
++                            get_qs_kind_set
++   USE qs_ks_types, ONLY: qs_ks_env_type, &
++                          set_ks_env
++   USE external_potential_types, ONLY: all_potential_type, &
++                                       gth_potential_type, &
++                                       sgp_potential_type
++   USE qs_mo_types, ONLY: get_mo_set, &
++                          mo_set_type, &
++                          set_mo_set
++   USE qs_mo_methods, ONLY: calculate_subspace_eigenvalues
++   USE qs_energy_types, ONLY: qs_energy_type
++   USE qs_scf_post_gpw, ONLY: ipi_workfunction_get_average, &
++                              ipi_workfunction_set_region
++   USE qs_subsys_types, ONLY: qs_subsys_get_qs => qs_subsys_get, &
++                              qs_subsys_set_qs => qs_subsys_set, &
++                              qs_subsys_type
++   USE atomic_kind_types, ONLY: atomic_kind_type
+ #ifndef __NO_SOCKETS
+    USE sockets_interface, ONLY: writebuffer, &
+                                 readbuffer, &
+@@ -59,10 +86,349 @@ MODULE ipi_driver
+ 
+    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'ipi_driver'
+ 
++   ! Unit conversion constants
++   REAL(KIND=dp), PARAMETER :: HARTREE_TO_EV = 27.211386245988_dp
++   INTEGER(KIND=int_4), PARAMETER :: IPI_FLAG_SOLVATION = 1_int_4
++   INTEGER(KIND=int_4), PARAMETER :: IPI_FLAG_NE_ELECTRODE = 2_int_4
++
+    PUBLIC :: run_driver
+ 
+ CONTAINS
+ 
++! **************************************************************************************************
++!> \brief Get fermi level, electron count, and optional workfunction for extras JSON
++!> \param force_env The force environment
++!> \param potential_average_axis Lattice axis (1=x, 2=y, 3=z)
++!> \param potential_average_min Minimum perpendicular coordinate in Angstrom
++!> \param potential_average_max Maximum perpendicular coordinate in Angstrom
++!> \param extras_json JSON string with extras information
++! **************************************************************************************************
++   SUBROUTINE get_extras_json(force_env, potential_average_axis, potential_average_min, &
++                              potential_average_max, extras_json)
++      TYPE(force_env_type), POINTER                      :: force_env
++      INTEGER, INTENT(IN)                                :: potential_average_axis
++      REAL(KIND=dp), INTENT(IN)                          :: potential_average_min, &
++                                                            potential_average_max
++      CHARACTER(LEN=*), INTENT(OUT)                      :: extras_json
++
++      CHARACTER(len=*), PARAMETER                        :: routineN = 'get_extras_json'
++
++      CHARACTER(LEN=24)                                  :: fermi_str, nelect_str, workfunction_str
++      INTEGER                                            :: handle, homo, ispin, nelect_int, nmo, &
++                                                            nspin
++      LOGICAL                                            :: have_workfunction
++      REAL(KIND=dp)                                      :: fermi_hartree, fermi_level_eV, &
++                                                            nelect_real, workfunction_eV
++      REAL(KIND=dp), DIMENSION(:), POINTER               :: mo_eigenvalues
++      TYPE(cp_fm_type), POINTER                          :: mo_coeff
++      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_ks
++      TYPE(dft_control_type), POINTER                    :: dft_control
++      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
++      TYPE(qs_energy_type), POINTER                      :: energy
++      TYPE(qs_environment_type), POINTER                 :: qs_env
++      TYPE(qs_subsys_type), POINTER                      :: qs_subsys
++
++      CALL timeset(routineN, handle)
++      have_workfunction = .FALSE.
++
++      NULLIFY (qs_env)
++      CALL force_env_get(force_env, qs_env=qs_env)
++      IF (.NOT. ASSOCIATED(qs_env)) THEN
++         CPABORT("CP2K i-PI constant-potential extras require a QS force environment.")
++      END IF
++
++      NULLIFY (energy)
++      NULLIFY (mos)
++      NULLIFY (qs_subsys)
++      NULLIFY (dft_control)
++      NULLIFY (matrix_ks)
++      NULLIFY (mo_coeff)
++      NULLIFY (mo_eigenvalues)
++      CALL get_qs_env(qs_env, energy=energy, mos=mos, subsys=qs_subsys, &
++                      dft_control=dft_control, matrix_ks=matrix_ks)
++      IF (.NOT. ASSOCIATED(energy)) THEN
++         CPABORT("CP2K i-PI constant-potential extras could not access QS energy data.")
++      END IF
++
++      fermi_hartree = energy%efermi
++      IF (fermi_hartree == 0.0_dp) THEN
++         IF (.NOT. ASSOCIATED(mos)) THEN
++            CPABORT("CP2K i-PI Fermi level is unset and no MO chemical potential is available.")
++         END IF
++         IF (SIZE(mos) <= 0) CPABORT("CP2K i-PI MO array is empty.")
++         nspin = SIZE(mos)
++         fermi_hartree = 0.0_dp
++         DO ispin = 1, nspin
++            IF (.NOT. IEEE_IS_FINITE(mos(ispin)%mu)) THEN
++               CPABORT("CP2K i-PI MO chemical potential is not finite.")
++            END IF
++            fermi_hartree = fermi_hartree + mos(ispin)%mu
++         END DO
++         fermi_hartree = fermi_hartree/REAL(nspin, KIND=dp)
++      END IF
++      IF (ABS(fermi_hartree) <= 10.0_dp*EPSILON(fermi_hartree)) THEN
++         ! Standard OT does not populate mo_set%mu or energy%efermi. Compute
++         ! the occupied-subspace Ritz eigenvalues from the converged KS matrix
++         ! and use the HOMO as the zero-temperature electronic chemical potential.
++         IF (.NOT. ASSOCIATED(mos) .OR. .NOT. ASSOCIATED(matrix_ks)) THEN
++            CPABORT("CP2K i-PI OT Fermi fallback requires MO and KS-matrix data.")
++         END IF
++         IF (SIZE(matrix_ks) < SIZE(mos)) THEN
++            CPABORT("CP2K i-PI OT Fermi fallback found too few KS matrices.")
++         END IF
++         IF (ASSOCIATED(dft_control)) THEN
++            IF (dft_control%do_admm) THEN
++               CPABORT("CP2K i-PI OT Fermi fallback does not yet support ADMM.")
++            END IF
++         END IF
++         nspin = SIZE(mos)
++         fermi_hartree = 0.0_dp
++         DO ispin = 1, nspin
++            NULLIFY (mo_coeff)
++            NULLIFY (mo_eigenvalues)
++            homo = 0
++            nmo = 0
++            CALL get_mo_set(mos(ispin), mo_coeff=mo_coeff, &
++                            eigenvalues=mo_eigenvalues, homo=homo, nmo=nmo)
++            IF (.NOT. ASSOCIATED(mo_coeff) .OR. .NOT. ASSOCIATED(mo_eigenvalues)) THEN
++               CPABORT("CP2K i-PI OT Fermi fallback could not access occupied orbitals.")
++            END IF
++            IF (homo <= 0 .OR. homo > nmo .OR. homo > SIZE(mo_eigenvalues)) THEN
++               CPABORT("CP2K i-PI OT Fermi fallback found an invalid HOMO index.")
++            END IF
++            CALL calculate_subspace_eigenvalues(orbitals=mo_coeff, &
++                                                ks_matrix=matrix_ks(ispin)%matrix, &
++                                                evals_arg=mo_eigenvalues, &
++                                                do_rotation=.FALSE.)
++            IF (.NOT. IEEE_IS_FINITE(mo_eigenvalues(homo))) THEN
++               CPABORT("CP2K i-PI OT HOMO energy is not finite.")
++            END IF
++            fermi_hartree = fermi_hartree + mo_eigenvalues(homo)
++         END DO
++         fermi_hartree = fermi_hartree/REAL(nspin, KIND=dp)
++      END IF
++      IF (.NOT. IEEE_IS_FINITE(fermi_hartree)) THEN
++         CPABORT("CP2K i-PI Fermi level is not finite.")
++      END IF
++      IF (ABS(fermi_hartree) <= 10.0_dp*EPSILON(fermi_hartree)) THEN
++         CPABORT("CP2K i-PI Fermi level remains unset after the OT fallback.")
++      END IF
++      fermi_level_eV = fermi_hartree*HARTREE_TO_EV
++
++      nelect_real = 0.0_dp
++      IF (ASSOCIATED(qs_subsys)) THEN
++         CALL qs_subsys_get_qs(qs_subsys, nelectron_total=nelect_int)
++         IF (nelect_int > 0) nelect_real = REAL(nelect_int, KIND=dp)
++      END IF
++      IF (nelect_real <= 0.0_dp .AND. ASSOCIATED(mos)) THEN
++         nspin = SIZE(mos)
++         DO ispin = 1, nspin
++            nelect_real = nelect_real + REAL(mos(ispin)%nelectron, KIND=dp)
++         END DO
++      END IF
++      IF (.NOT. IEEE_IS_FINITE(nelect_real) .OR. nelect_real <= 0.0_dp) THEN
++         CPABORT("CP2K i-PI constant-potential extras could not determine a valid electron count.")
++      END IF
++
++      IF (potential_average_max > potential_average_min) THEN
++         CALL compute_workfunction_from_vhartree(force_env, potential_average_axis, &
++                                                 potential_average_min, potential_average_max, &
++                                                 fermi_level_eV, workfunction_eV)
++         IF (.NOT. IEEE_IS_FINITE(workfunction_eV)) THEN
++            CPABORT("CP2K i-PI workfunction is not finite.")
++         END IF
++         have_workfunction = .TRUE.
++      END IF
++
++      WRITE (fermi_str, '(ES24.16E3)') fermi_level_eV
++      WRITE (nelect_str, '(ES24.16E3)') nelect_real
++      extras_json = '{"fermi_level_eV": '//TRIM(ADJUSTL(fermi_str))// &
++                    ', "nelect": '//TRIM(ADJUSTL(nelect_str))
++      IF (have_workfunction) THEN
++         WRITE (workfunction_str, '(ES24.16E3)') workfunction_eV
++         extras_json = TRIM(extras_json)// &
++                       ', "workfunction_eV": '//TRIM(ADJUSTL(workfunction_str))
++      END IF
++      extras_json = TRIM(extras_json)//'}'
++
++      CALL timestop(handle)
++   END SUBROUTINE get_extras_json
++
++! **************************************************************************************************
++!> \brief Compute a workfunction from the latest cube-equivalent Hartree average.
++!>
++!> The average is updated during the GPW post-SCF path, before the force-building path
++!> modifies v_hartree_rspace for one-center force integrations.
++! **************************************************************************************************
++   SUBROUTINE compute_workfunction_from_vhartree(force_env, axis, minimum_A, maximum_A, &
++                                                 fermi_level_eV, workfunction_eV)
++      TYPE(force_env_type), POINTER                      :: force_env
++      INTEGER, INTENT(IN)                                :: axis
++      REAL(KIND=dp), INTENT(IN)                          :: minimum_A, maximum_A, fermi_level_eV
++      REAL(KIND=dp), INTENT(OUT)                         :: workfunction_eV
++
++      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_workfunction_from_vhartree'
++
++      INTEGER                                            :: handle
++      LOGICAL                                            :: average_available
++      REAL(KIND=dp)                                      :: v_avg_hartree
++
++      CALL timeset(routineN, handle)
++
++      IF (axis < 1 .OR. axis > 3) THEN
++         CPABORT("CP2K i-PI workfunction update requires axis x, y, or z.")
++      END IF
++      IF (maximum_A <= minimum_A) THEN
++         CPABORT("CP2K i-PI workfunction update requires potential_average_max_A > min_A.")
++      END IF
++
++      CALL ipi_workfunction_get_average(v_avg_hartree, average_available)
++      IF (.NOT. average_available) THEN
++         CPABORT("CP2K i-PI workfunction update did not receive a post-SCF Hartree average.")
++      END IF
++      workfunction_eV = v_avg_hartree*HARTREE_TO_EV - fermi_level_eV
++
++      CALL timestop(handle)
++   END SUBROUTINE compute_workfunction_from_vhartree
++
++! **************************************************************************************************
++!> \brief Parse the i-PI INIT string for a real-valued token.
++! **************************************************************************************************
++   SUBROUTINE parse_init_real_token(init_string, token, value, found)
++      CHARACTER(LEN=*), INTENT(IN)                       :: init_string, token
++      REAL(KIND=dp), INTENT(OUT)                         :: value
++      LOGICAL, INTENT(OUT)                               :: found
++
++      CHARACTER(LEN=:), ALLOCATABLE                      :: value_string
++      INTEGER                                            :: colon_pos, end_pos, ios, start_pos, &
++                                                            token_pos
++
++      found = .FALSE.
++      token_pos = INDEX(init_string, TRIM(token))
++      IF (token_pos <= 0) RETURN
++
++      colon_pos = INDEX(init_string(token_pos:), ":")
++      IF (colon_pos <= 0) CPABORT("Malformed i-PI INIT token: missing ':'.")
++
++      start_pos = token_pos + colon_pos
++      DO WHILE (start_pos <= LEN_TRIM(init_string))
++         IF (init_string(start_pos:start_pos) /= " " .AND. &
++             init_string(start_pos:start_pos) /= "," .AND. &
++             init_string(start_pos:start_pos) /= ";") EXIT
++         start_pos = start_pos + 1
++      END DO
++      IF (start_pos > LEN_TRIM(init_string)) CPABORT("Malformed i-PI INIT token: missing value.")
++
++      end_pos = start_pos
++      DO WHILE (end_pos <= LEN_TRIM(init_string))
++         IF (init_string(end_pos:end_pos) == "," .OR. init_string(end_pos:end_pos) == ";") EXIT
++         end_pos = end_pos + 1
++      END DO
++
++      value_string = init_string(start_pos:end_pos - 1)
++      READ (value_string, *, IOSTAT=ios) value
++      IF (ios /= 0 .OR. .NOT. IEEE_IS_FINITE(value)) THEN
++         CPABORT("Malformed i-PI INIT token: value is not a finite real number.")
++      END IF
++      found = .TRUE.
++   END SUBROUTINE parse_init_real_token
++
++! **************************************************************************************************
++!> \brief Parse an x/y/z lattice-axis token from the i-PI INIT string.
++! **************************************************************************************************
++   SUBROUTINE parse_init_axis_token(init_string, token, axis, found)
++      CHARACTER(LEN=*), INTENT(IN)                       :: init_string, token
++      INTEGER, INTENT(OUT)                               :: axis
++      LOGICAL, INTENT(OUT)                               :: found
++
++      INTEGER                                            :: colon_pos, start_pos, token_pos
++
++      found = .FALSE.
++      axis = 0
++      token_pos = INDEX(init_string, TRIM(token))
++      IF (token_pos <= 0) RETURN
++      colon_pos = INDEX(init_string(token_pos:), ":")
++      IF (colon_pos <= 0) CPABORT("Malformed i-PI INIT axis token: missing ':'.")
++      start_pos = token_pos + colon_pos
++      DO WHILE (start_pos <= LEN_TRIM(init_string))
++         IF (init_string(start_pos:start_pos) /= " " .AND. &
++             init_string(start_pos:start_pos) /= "," .AND. &
++             init_string(start_pos:start_pos) /= ";") EXIT
++         start_pos = start_pos + 1
++      END DO
++      IF (start_pos > LEN_TRIM(init_string)) CPABORT("Malformed i-PI INIT axis token: missing value.")
++      SELECT CASE (init_string(start_pos:start_pos))
++      CASE ("x", "X")
++         axis = 1
++      CASE ("y", "Y")
++         axis = 2
++      CASE ("z", "Z")
++         axis = 3
++      CASE DEFAULT
++         CPABORT("CP2K i-PI INIT potential_average_axis must be x, y, or z.")
++      END SELECT
++      found = .TRUE.
++   END SUBROUTINE parse_init_axis_token
++
++! **************************************************************************************************
++!> \brief Parse i-PI INIT parameters used by constant-potential CP2K driver mode.
++! **************************************************************************************************
++   SUBROUTINE parse_ipi_init_string(init_string, potential_average_axis, &
++                                    potential_average_min, potential_average_max, &
++                                    neutral_electrons_ref, solvation_update_stride, &
++                                    solvation_update_stride_declared)
++      CHARACTER(LEN=*), INTENT(IN)                       :: init_string
++      INTEGER, INTENT(INOUT)                             :: potential_average_axis
++      REAL(KIND=dp), INTENT(INOUT)                       :: potential_average_min, &
++                                                            potential_average_max, &
++                                                            neutral_electrons_ref
++      INTEGER, INTENT(INOUT)                             :: solvation_update_stride
++      LOGICAL, INTENT(OUT) :: solvation_update_stride_declared
++
++      INTEGER                                            :: parsed_axis
++      LOGICAL                                            :: found_axis, found_maximum, &
++                                                            found_minimum, found_neutral, &
++                                                            found_stride
++      REAL(KIND=dp)                                      :: maximum, minimum, neutral_ref, &
++                                                            stride_real
++
++      minimum = potential_average_min
++      maximum = potential_average_max
++      neutral_ref = neutral_electrons_ref
++      CALL parse_init_axis_token(init_string, "potential_average_axis", parsed_axis, found_axis)
++      CALL parse_init_real_token(init_string, "potential_average_min_A", minimum, found_minimum)
++      CALL parse_init_real_token(init_string, "potential_average_max_A", maximum, found_maximum)
++      CALL parse_init_real_token(init_string, "neutral_electrons", neutral_ref, found_neutral)
++      CALL parse_init_real_token(init_string, "solvation_update_stride", stride_real, found_stride)
++
++      IF ((found_axis .NEQV. found_minimum) .OR. (found_axis .NEQV. found_maximum)) THEN
++         CPABORT("CP2K i-PI INIT must contain potential_average_axis and both region bounds.")
++      END IF
++
++      IF (found_axis) THEN
++         IF (maximum <= minimum) THEN
++            CPABORT("CP2K i-PI INIT requires potential_average_max_A > min_A.")
++         END IF
++         potential_average_axis = parsed_axis
++         potential_average_min = minimum
++         potential_average_max = maximum
++      END IF
++
++      IF (found_neutral) THEN
++         IF (neutral_ref <= 0.0_dp) THEN
++            CPABORT("CP2K i-PI INIT requires neutral_electrons > 0 for Ne-electrode mode.")
++         END IF
++         neutral_electrons_ref = neutral_ref
++      END IF
++
++      solvation_update_stride_declared = found_stride
++      IF (found_stride) THEN
++         IF (stride_real < 1.0_dp .OR. ABS(stride_real - ANINT(stride_real)) > 1.0e-12_dp) THEN
++            CPABORT("CP2K i-PI INIT solvation_update_stride must be a positive integer.")
++         END IF
++         solvation_update_stride = NINT(stride_real)
++      END IF
++   END SUBROUTINE parse_ipi_init_string
+ ! **************************************************************************************************
+ !> \brief ...
+ !> \param force_env ...
+@@ -89,22 +455,33 @@ CONTAINS
+ 
+       CHARACTER(len=default_path_length)       :: c_hostname, drv_hostname
+       CHARACTER(LEN=default_string_length)     :: header
++      CHARACTER(LEN=1000)                      :: extras_json  ! Buffer for JSON extras
++      CHARACTER(LEN=:), ALLOCATABLE            :: init_string
+       INTEGER                                  :: drv_port, handle, i_drv_unix, &
+                                                   idir, ii, inet, ip, iwait, &
+-                                                  nat, output_unit, socket
++                                                  init_id, init_len, nat, output_unit, socket, &
++                                                  json_len, potential_average_axis, &
++                                                  solvation_update_stride
++      INTEGER(KIND=int_4)                      :: chg_flag, previous_chg_flag
+       TYPE(mp_request_type), DIMENSION(2) ::                                            wait_req
+       INTEGER(KIND=int_4), POINTER             :: wait_msg(:)
+-      LOGICAL                                  :: drv_unix, fwait, hasdata, &
+-                                                  ionode, should_stop
++      LOGICAL                                  :: charge_initialized, constant_potential_active, drv_unix, &
++                                                  electronic_state_changed, fwait, geometry_changed, &
++                                                  geometry_initialized, hasdata, init_done, ionode, &
++                                                  response_cached, reuse_response, should_stop, &
++                                                  solvation_update_stride_declared
+       REAL(KIND=dp)                            :: cellh(3, 3), cellih(3, 3), &
+-                                                  mxmat(9), pot, vir(3, 3)
+-      REAL(KIND=dp), ALLOCATABLE               :: combuf(:)
+-      TYPE(cell_type), POINTER                 :: cpcell
++                                                  mxmat(9), pot, previous_cellh(3, 3), previous_pot, &
++                                                  previous_vir(3, 3), vir(3, 3)
++      REAL(KIND=dp), ALLOCATABLE               :: combuf(:), previous_forces(:), previous_positions(:)
++      TYPE(cell_type), POINTER                 :: cpcell, current_cell
+       TYPE(mp_para_env_type), POINTER          :: para_env
+       TYPE(cp_subsys_type), POINTER            :: subsys
+       TYPE(section_vals_type), POINTER         :: drv_section, motion_section
+       TYPE(virial_type), POINTER               :: virial
+-      REAL(KIND=dp)                            :: sleeptime
++      REAL(KIND=dp)                            :: sleeptime, chg_value, neutral_electrons_ref, &
++                                                  potential_average_max, potential_average_min, &
++                                                  previous_chg_value
+ 
+       CALL timeset(routineN, handle)
+ 
+@@ -132,6 +509,18 @@ CONTAINS
+       CALL section_vals_val_get(drv_section, "UNIX", l_val=drv_unix)
+       CALL section_vals_val_get(drv_section, "SLEEP_TIME", r_val=sleeptime)
+       CPASSERT(sleeptime >= 0)
++      potential_average_axis = 3
++      potential_average_min = -1.0_dp
++      potential_average_max = -1.0_dp
++      neutral_electrons_ref = -1.0_dp
++      solvation_update_stride = 1
++      solvation_update_stride_declared = .FALSE.
++      init_done = .FALSE.
++      constant_potential_active = .FALSE.
++      geometry_initialized = .FALSE.
++      charge_initialized = .FALSE.
++      electronic_state_changed = .TRUE.
++      response_cached = .FALSE.
+ 
+       ! opens the socket
+       socket = 0
+@@ -181,88 +570,246 @@ CONTAINS
+          CALL para_env%bcast(header)
+ 
+          IF (output_unit > 0) WRITE (output_unit, *) " @ DRIVER MODE: Message from server: ", TRIM(header)
+-         IF (TRIM(header) == "STATUS") THEN
+ 
++         IF (TRIM(header) == "STATUS") THEN
+             CALL para_env%sync()
+             IF (ionode) THEN ! does not  need init (well, maybe it should, just to check atom numbers and the like... )
+-               IF (hasdata) THEN
++               IF (.NOT. init_done) THEN
++                  CALL writebuffer(socket, "NEEDINIT    ", MSGLEN)
++               ELSE IF (hasdata) THEN
+                   CALL writebuffer(socket, "HAVEDATA    ", MSGLEN)
+                ELSE
+                   CALL writebuffer(socket, "READY       ", MSGLEN)
+                END IF
+             END IF
+             CALL para_env%sync()
++         ELSE IF (TRIM(header) == "INIT") THEN
++            IF (ionode) THEN
++               CALL readbuffer(socket, init_id)
++               CALL readbuffer(socket, init_len)
++               IF (init_len < 0) THEN
++                  CPABORT("CP2K i-PI driver received a negative INIT string length.")
++               END IF
++               IF (init_len > 0) THEN
++                  ALLOCATE (CHARACTER(LEN=init_len) :: init_string)
++                  CALL readbuffer(socket, init_string, init_len)
++                  CALL parse_ipi_init_string(init_string, potential_average_axis, &
++                                             potential_average_min, potential_average_max, &
++                                             neutral_electrons_ref, solvation_update_stride, &
++                                             solvation_update_stride_declared)
++                  DEALLOCATE (init_string)
++               END IF
++            END IF
++            CALL para_env%bcast(potential_average_axis, 0)
++            CALL para_env%bcast(potential_average_min, 0)
++            CALL para_env%bcast(potential_average_max, 0)
++            CALL para_env%bcast(neutral_electrons_ref, 0)
++            CALL para_env%bcast(solvation_update_stride, 0)
++            CALL para_env%bcast(solvation_update_stride_declared, 0)
++            CALL ipi_workfunction_set_region(potential_average_axis, potential_average_min, &
++                                             potential_average_max)
++            init_done = .TRUE.
+          ELSE IF (TRIM(header) == "POSDATA") THEN
+             IF (ionode) THEN
+                CALL readbuffer(socket, mxmat, 9)
+-               cellh = RESHAPE(mxmat, [3, 3])
++               cellh = RESHAPE(mxmat, (/3, 3/))
+                CALL readbuffer(socket, mxmat, 9)
+-               cellih = RESHAPE(mxmat, [3, 3])
++               cellih = RESHAPE(mxmat, (/3, 3/))
+                CALL readbuffer(socket, nat)
+                cellh = TRANSPOSE(cellh)
+                cellih = TRANSPOSE(cellih)
+             END IF
+-            CALL para_env%bcast(cellh)
+-            CALL para_env%bcast(cellih)
+-            CALL para_env%bcast(nat)
+-            IF (.NOT. ALLOCATED(combuf)) ALLOCATE (combuf(3*nat))
++            CALL para_env%bcast(cellh, 0)
++            CALL para_env%bcast(cellih, 0)
++            CALL para_env%bcast(nat, 0)
++            IF (.NOT. ALLOCATED(combuf)) THEN
++               ALLOCATE (combuf(3*nat))
++               ALLOCATE (previous_forces(3*nat))
++               ALLOCATE (previous_positions(3*nat))
++               DO ii = 1, 3*nat
++                  previous_forces(ii) = 0.0_dp
++               END DO
++               previous_pot = 0.0_dp
++               previous_vir = 0.0_dp
++            END IF
+             IF (ionode) CALL readbuffer(socket, combuf, nat*3)
+-            CALL para_env%bcast(combuf)
++            CALL para_env%bcast(combuf, 0)
+ 
+             CALL force_env_get(force_env, subsys=subsys)
+             IF (nat /= subsys%particles%n_els) &
+                CPABORT("@DRIVER MODE: Uh-oh! Particle number mismatch between i-PI and cp2k input!")
+-            ii = 0
+-            DO ip = 1, subsys%particles%n_els
+-               DO idir = 1, 3
+-                  ii = ii + 1
+-                  subsys%particles%els(ip)%r(idir) = combuf(ii)
++
++            IF (constant_potential_active .AND. .NOT. geometry_initialized) THEN
++               NULLIFY (current_cell)
++               CALL force_env_get(force_env, cell=current_cell)
++               IF (.NOT. ASSOCIATED(current_cell)) THEN
++                  CPABORT("CP2K i-PI constant-potential driver could not access the current cell.")
++               END IF
++               CALL get_cell(current_cell, h=previous_cellh)
++               ii = 0
++               DO ip = 1, subsys%particles%n_els
++                  DO idir = 1, 3
++                     ii = ii + 1
++                     previous_positions(ii) = subsys%particles%els(ip)%r(idir)
++                  END DO
+                END DO
+-            END DO
+-            CALL init_cell(cpcell, hmat=cellh)
+-            CALL cp_subsys_set(subsys, cell=cpcell)
++               geometry_initialized = .TRUE.
++            END IF
+ 
+-            CALL force_env_calc_energy_force(force_env, calc_force=.TRUE.)
++            ! In constant-potential mode an electronic update can invalidate the
++            ! i-PI force cache even when the endpoint charge and nuclear geometry
++            ! are unchanged. Avoid resetting CP2K's cell/position dependencies in
++            ! that exact case, so the converged OT state remains reusable. Keep the
++            ! ordinary upstream driver path unchanged.
++            geometry_changed = .TRUE.
++            IF (constant_potential_active .AND. geometry_initialized) THEN
++               geometry_changed = ANY(cellh /= previous_cellh) .OR. &
++                                  ANY(combuf /= previous_positions)
++            END IF
+ 
+-            IF (output_unit > 0) WRITE (output_unit, *) " @ DRIVER MODE: Received positions "
++            IF (geometry_changed) THEN
++               ii = 0
++               DO ip = 1, subsys%particles%n_els
++                  DO idir = 1, 3
++                     ii = ii + 1
++                     subsys%particles%els(ip)%r(idir) = combuf(ii)
++                  END DO
++               END DO
++               CALL init_cell(cpcell, hmat=cellh)
++               CALL cp_subsys_set(subsys, cell=cpcell)
++
++               IF (constant_potential_active) THEN
++                  previous_cellh = cellh
++                  previous_positions = combuf
++                  geometry_initialized = .TRUE.
++               END IF
++            END IF
+ 
+-            combuf = 0
+-            ii = 0
+-            DO ip = 1, subsys%particles%n_els
+-               DO idir = 1, 3
+-                  ii = ii + 1
+-                  combuf(ii) = subsys%particles%els(ip)%f(idir)
++            reuse_response = constant_potential_active .AND. response_cached .AND. &
++                             .NOT. geometry_changed .AND. .NOT. electronic_state_changed
++            IF (reuse_response) THEN
++               IF (.NOT. ALLOCATED(previous_forces)) THEN
++                  CPABORT("CP2K i-PI response cache is marked valid without a force buffer.")
++               END IF
++               IF (SIZE(previous_forces) /= SIZE(combuf)) THEN
++                  CPABORT("CP2K i-PI response cache force-buffer size mismatch.")
++               END IF
++               DO ii = 1, SIZE(combuf)
++                  combuf(ii) = previous_forces(ii)
+                END DO
+-            END DO
+-            CALL force_env_get(force_env, potential_energy=pot)
+-            CALL force_env_get(force_env, cell=cpcell)
+-            CALL cp_subsys_get(subsys, virial=virial)
+-            vir = TRANSPOSE(virial%pv_virial)
++               pot = previous_pot
++               vir = previous_vir
++            ELSE
++               CALL force_env_calc_energy_force(force_env, calc_force=.TRUE.)
++
++               combuf = 0
++               ii = 0
++               DO ip = 1, subsys%particles%n_els
++                  DO idir = 1, 3
++                     ii = ii + 1
++                     combuf(ii) = subsys%particles%els(ip)%f(idir)
++                  END DO
++               END DO
++               CALL force_env_get(force_env, potential_energy=pot)
++               CALL force_env_get(force_env, cell=cpcell)
++               CALL cp_subsys_get(subsys, virial=virial)
++               vir = TRANSPOSE(virial%pv_virial)
++
++               IF (constant_potential_active) THEN
++                  DO ii = 1, SIZE(combuf)
++                     previous_forces(ii) = combuf(ii)
++                  END DO
++                  previous_pot = pot
++                  previous_vir = vir
++                  response_cached = .TRUE.
++               END IF
++            END IF
++
++            IF (output_unit > 0) WRITE (output_unit, *) " @ DRIVER MODE: Received positions "
+ 
+             CALL external_control(should_stop, "IPI", globenv=globenv)
+-            IF (should_stop) EXIT driver_loop
++            IF (should_stop) EXIT
+ 
+             hasdata = .TRUE.
+          ELSE IF (TRIM(header) == "GETFORCE") THEN
+             IF (output_unit > 0) WRITE (output_unit, *) " @ DRIVER MODE: Returning v,forces,stress "
++            IF (constant_potential_active) THEN
++               ! Workfunction averaging uses MPI reductions, so all ranks must enter it.
++               CALL get_extras_json(force_env, potential_average_axis, potential_average_min, &
++                                    potential_average_max, extras_json)
++               json_len = LEN_TRIM(extras_json)
++            ELSE
++               json_len = 0
++            END IF
+             IF (ionode) THEN
+                CALL writebuffer(socket, "FORCEREADY  ", MSGLEN)
+                CALL writebuffer(socket, pot)
+                CALL writebuffer(socket, nat)
+                CALL writebuffer(socket, combuf, 3*nat)
+-               CALL writebuffer(socket, RESHAPE(vir, [9]), 9)
+-
+-               ! i-pi can also receive an arbitrary string, that will be printed out to the "extra"
+-               ! trajectory file. this is useful if you want to return additional information, e.g.
+-               ! atomic charges, wannier centres, etc. one must return the number of characters, then
+-               ! the string. here we just send back zero characters.
+-               nat = 0
+-               CALL writebuffer(socket, nat) ! writes out zero for the length of the "extra" field (not implemented yet!)
++               CALL writebuffer(socket, RESHAPE(vir, (/9/)), 9)
++
++               IF (output_unit > 0 .AND. constant_potential_active) THEN
++                  WRITE (output_unit, *) " @ DRIVER MODE: Sending extras JSON: ", TRIM(extras_json)
++               END IF
++
++               ! Send the length of the JSON string, then the string itself
++               CALL writebuffer(socket, json_len)
++               IF (json_len > 0) THEN
++                  ! Send JSON string as a character buffer
++                  CALL writebuffer(socket, TRIM(extras_json), json_len)
++               END IF
+             END IF
+             hasdata = .FALSE.
++         ELSE IF (TRIM(header) == "CHGDATA") THEN
++            ! Lightweight constant-potential update:
++            !   float64 target total electron number + int32 mode bitmask.
++            ! bit 0: workfunction/solvation updates, bit 1: Ne-electrode mode.
++
++            IF (ionode) THEN
++               CALL readbuffer(socket, chg_value)
++               CALL readbuffer(socket, chg_flag)
++            END IF
++
++            CALL para_env%bcast(chg_value, 0)
++            CALL para_env%bcast(chg_flag, 0)
++
++            electronic_state_changed = .NOT. charge_initialized
++            IF (charge_initialized) THEN
++               electronic_state_changed = chg_flag /= previous_chg_flag .OR. &
++                                          chg_value /= previous_chg_value
++            END IF
++            previous_chg_flag = chg_flag
++            previous_chg_value = chg_value
++            charge_initialized = .TRUE.
++
++            IF (chg_flag < 0 .OR. chg_flag > IPI_FLAG_SOLVATION + IPI_FLAG_NE_ELECTRODE) THEN
++               CPABORT("CP2K i-PI CHGDATA received an unsupported mode_flags value.")
++            END IF
++            IF (.NOT. solvation_update_stride_declared) THEN
++               CPABORT("CP2K i-PI constant-potential mode requires solvation_update_stride in INIT.")
++            END IF
++            IF (solvation_update_stride > 1) THEN
++               CALL cp_abort(__LOCATION__, &
++                             "CP2K cannot safely freeze the full implicit-solvent state: the implicit "// &
++                             "Poisson solve jointly updates Hartree potential, dielectric response, energy, "// &
++                             "and force data, but CP2K exposes only an iterative initial guess. "// &
++                             "Use solvation_update_stride=1.")
++            END IF
++            IF (IAND(chg_flag, IPI_FLAG_SOLVATION) == 0) THEN
++               CALL cp_abort(__LOCATION__, &
++                             "CP2K received a frozen-solvent CHGDATA request with "// &
++                             "solvation_update_stride=1; i-PI/driver scheduling is inconsistent.")
++            END IF
++
++            IF (IAND(chg_flag, IPI_FLAG_NE_ELECTRODE) /= 0) THEN
++               CALL apply_ne_core_correction(force_env, chg_value, neutral_electrons_ref)
++            ELSE
++               CALL apply_cp2k_nelect(force_env, chg_value)
++            END IF
++            constant_potential_active = .TRUE.
+          ELSE
+             IF (output_unit > 0) WRITE (output_unit, *) " @DRIVER MODE:  Socket disconnected, time to exit."
+-            EXIT driver_loop
++            EXIT
+          END IF
+       END DO driver_loop
+ 
+@@ -274,4 +821,365 @@ CONTAINS
+       CALL timestop(handle)
+ 
+    END SUBROUTINE run_driver
++
++! **************************************************************************************************
++!> \brief   Apply an integer total electron count received from i-PI.
++!>
++!> The CHGDATA value is interpreted as the target total electron number. CP2K
++!> keeps the user-provided spin setup and multiplicity; incompatible integer
++!> electron counts abort explicitly instead of being rounded or repaired.
++! **************************************************************************************************
++   SUBROUTINE apply_cp2k_nelect(force_env, target_nelect)
++
++      TYPE(force_env_type), POINTER                      :: force_env
++      REAL(KIND=dp), INTENT(IN)                          :: target_nelect
++
++      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'apply_cp2k_nelect'
++
++      INTEGER :: current_nelect, handle, homo, ifill, ispin, lfomo, multiplicity, needed_mos, &
++         nelectron_spin(2), neutral_nelect, new_charge, nmo, nspins, target_int
++      LOGICAL                                            :: state_unchanged
++      REAL(KIND=dp)                                      :: delta, maxocc, remaining_occ
++      REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation_numbers
++      TYPE(dft_control_type), POINTER                    :: dft_control
++      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
++      TYPE(qs_environment_type), POINTER                 :: qs_env
++      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
++      TYPE(qs_ks_env_type), POINTER                      :: ks_env
++      TYPE(qs_subsys_type), POINTER                      :: qs_subsys
++
++      CALL timeset(routineN, handle)
++
++      target_int = NINT(target_nelect)
++      delta = ABS(target_nelect - REAL(target_int, KIND=dp))
++      IF (delta > 1.0e-8_dp) THEN
++         CPABORT("CHGDATA target electron number for CP2K must be an integer.")
++      END IF
++      IF (target_int <= 0) THEN
++         CPABORT("CHGDATA target electron number for CP2K must be positive.")
++      END IF
++
++      NULLIFY (qs_env)
++      CALL force_env_get(force_env, qs_env=qs_env)
++      IF (.NOT. ASSOCIATED(qs_env)) THEN
++         CPABORT("CHGDATA electron-number update requires a QS force environment.")
++      END IF
++
++      NULLIFY (qs_kind_set)
++      NULLIFY (qs_subsys)
++      NULLIFY (dft_control)
++      NULLIFY (mos)
++      NULLIFY (ks_env)
++      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, subsys=qs_subsys, &
++                      dft_control=dft_control, mos=mos, ks_env=ks_env)
++
++      IF (.NOT. ASSOCIATED(qs_kind_set)) THEN
++         CPABORT("CHGDATA electron-number update could not access qs_kind_set.")
++      END IF
++      IF (.NOT. ASSOCIATED(qs_subsys)) THEN
++         CPABORT("CHGDATA electron-number update could not access qs_subsys.")
++      END IF
++      IF (.NOT. ASSOCIATED(dft_control)) THEN
++         CPABORT("CHGDATA electron-number update could not access dft_control.")
++      END IF
++
++      neutral_nelect = 0
++      CALL get_qs_kind_set(qs_kind_set, nelectron=neutral_nelect)
++      IF (neutral_nelect <= 0) THEN
++         CPABORT("CHGDATA electron-number update could not determine neutral electron count.")
++      END IF
++
++      new_charge = neutral_nelect - target_int
++      nspins = dft_control%nspins
++      multiplicity = dft_control%multiplicity
++      nelectron_spin(:) = 0
++
++      IF (nspins == 1) THEN
++         IF (MODULO(target_int, 2) /= 0 .AND. .NOT. dft_control%smear) THEN
++            CPABORT("CP2K single-spin CHGDATA update received an odd electron count. Use UKS/LSD.")
++         END IF
++         nelectron_spin(1) = target_int
++      ELSEIF (nspins == 2) THEN
++         IF (multiplicity <= 0) THEN
++            CPABORT("CP2K CHGDATA update requires an explicit MULTIPLICITY for UKS/LSD.")
++         END IF
++         IF (MODULO(target_int + multiplicity - 1, 2) /= 0) THEN
++            CPABORT("CP2K CHGDATA update is incompatible with the current MULTIPLICITY.")
++         END IF
++         nelectron_spin(1) = (target_int + multiplicity - 1)/2
++         nelectron_spin(2) = (target_int - multiplicity + 1)/2
++         IF (nelectron_spin(2) < 0) THEN
++            CPABORT("CP2K CHGDATA update has too few electrons for the current MULTIPLICITY.")
++         END IF
++      ELSE
++         CPABORT("CP2K CHGDATA update supports only NSPIN 1 or 2.")
++      END IF
++
++      ! Preserve the converged OT orbitals when a fixed charge-mixing endpoint
++      ! receives the same electron count on consecutive force requests. Rewriting
++      ! identical occupations and marking the potential as changed destroys OT
++      ! continuation and can add hundreds of unnecessary SCF iterations.
++      current_nelect = -1
++      CALL qs_subsys_get_qs(qs_subsys, nelectron_total=current_nelect)
++      state_unchanged = current_nelect == target_int .AND. &
++                        dft_control%charge == new_charge
++
++      IF (state_unchanged) THEN
++         CALL timestop(handle)
++         RETURN
++      END IF
++
++      dft_control%charge = new_charge
++      CALL qs_subsys_set_qs(qs_subsys, nelectron_total=target_int, nelectron_spin=nelectron_spin)
++
++      IF (ASSOCIATED(mos)) THEN
++         IF (SIZE(mos) < nspins) THEN
++            CPABORT("CP2K CHGDATA update found fewer MO sets than spin channels.")
++         END IF
++
++         DO ispin = 1, nspins
++            NULLIFY (occupation_numbers)
++            maxocc = 0.0_dp
++            nmo = 0
++            CALL get_mo_set(mos(ispin), maxocc=maxocc, nmo=nmo, &
++                            occupation_numbers=occupation_numbers)
++
++            IF (maxocc <= 0.0_dp) THEN
++               CPABORT("CP2K CHGDATA update found an invalid MO occupation capacity.")
++            END IF
++
++            needed_mos = 0
++            IF (nelectron_spin(ispin) > 0) THEN
++               needed_mos = CEILING(REAL(nelectron_spin(ispin), KIND=dp)/maxocc - 1.0e-12_dp)
++            END IF
++            IF (needed_mos > nmo) THEN
++               CPABORT("CP2K CHGDATA update needs more MOs. Increase ADDED_MOS in the CP2K input.")
++            END IF
++
++            CALL set_mo_set(mos(ispin), nelectron=nelectron_spin(ispin), &
++                            n_el_f=REAL(nelectron_spin(ispin), KIND=dp))
++
++            IF (ASSOCIATED(occupation_numbers)) THEN
++               occupation_numbers(:) = 0.0_dp
++               remaining_occ = REAL(nelectron_spin(ispin), KIND=dp)
++               ifill = 0
++               DO WHILE (remaining_occ > maxocc - 1.0e-12_dp)
++                  ifill = ifill + 1
++                  occupation_numbers(ifill) = maxocc
++                  remaining_occ = remaining_occ - maxocc
++               END DO
++
++               IF (remaining_occ > 1.0e-12_dp) THEN
++                  ifill = ifill + 1
++                  occupation_numbers(ifill) = remaining_occ
++               END IF
++
++               homo = ifill
++               lfomo = MIN(homo + 1, nmo)
++               CALL set_mo_set(mos(ispin), homo=homo, lfomo=lfomo)
++            END IF
++         END DO
++      END IF
++
++      IF (ASSOCIATED(ks_env)) THEN
++         CALL set_ks_env(ks_env, potential_changed=.TRUE., &
++                         forces_up_to_date=.FALSE.)
++      END IF
++
++      CALL timestop(handle)
++
++   END SUBROUTINE apply_cp2k_nelect
++
++! **************************************************************************************************
++!> \brief   Apply Ne core correction update from i-PI total electron number.
++!>
++!> Receives the target total electron number and converts it to a per-Ne core
++!> correction using core_corr_ne = (target_nelect - neutral_electrons_ref)/N_ne.
++!> It applies the resulting value to all Ne atomic kinds in the QS subsystem by
++!> updating the underlying all-electron or GTH/SGP potential zeff_correction
++!> field. This effectively corresponds to adjusting the CORE_CORRECTION keyword
++!> for Ne.
++!>
++!> The implementation traverses the QS environment, obtains the atomic kind
++!> and QS kind arrays, and for each kind whose element symbol is 'Ne' it
++!> updates zeff_correction := core_corr_ne and keeps the associated effective
++!> charge parameters consistent with a statically parsed CORE_CORRECTION input.
++!> The resulting change is reflected in the subsequent charge and electron
++!> counts through the existing zeff_correction usage in QS routines.
++! **************************************************************************************************
++   SUBROUTINE apply_ne_core_correction(force_env, target_nelect, neutral_electrons_ref)
++
++      TYPE(force_env_type), POINTER                      :: force_env
++      REAL(KIND=dp), INTENT(IN)                          :: target_nelect, neutral_electrons_ref
++
++      CHARACTER(LEN=*), PARAMETER :: routineN = 'apply_ne_core_correction'
++      REAL(KIND=dp), PARAMETER :: core_corr_refresh_tol = 1.0e-12_dp
++
++      CHARACTER(LEN=2)                                   :: elem
++      INTEGER                                            :: handle, ikind, iparticle, n_ne_atoms, &
++                                                            nkind, output_unit
++      LOGICAL                                            :: core_corr_changed, found_ne
++      REAL(KIND=dp)                                      :: base_zeff, core_corr_ne, delta_q, &
++                                                            new_zeff, old_zeff, zeff_scale
++      TYPE(all_potential_type), POINTER                  :: all_potential
++      TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
++      TYPE(atomic_kind_type), POINTER                    :: atomic_kind
++      TYPE(cp_subsys_type), POINTER                      :: cp_subsys
++      TYPE(gth_potential_type), POINTER                  :: gth_potential
++      TYPE(qs_environment_type), POINTER                 :: qs_env
++      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
++      TYPE(qs_kind_type), POINTER                        :: qs_kind
++      TYPE(qs_ks_env_type), POINTER                      :: ks_env
++      TYPE(sgp_potential_type), POINTER                  :: sgp_potential
++
++      CALL timeset(routineN, handle)
++
++      IF (.NOT. IEEE_IS_FINITE(target_nelect) .OR. target_nelect <= 0.0_dp) THEN
++         CPABORT("CHGDATA Ne-electrode mode requires a finite positive target electron number.")
++      END IF
++      IF (.NOT. IEEE_IS_FINITE(neutral_electrons_ref) .OR. neutral_electrons_ref <= 0.0_dp) THEN
++         CPABORT("CHGDATA Ne-electrode mode requires neutral_electrons from INIT.")
++      END IF
++
++      ! Obtain QS environment and atomic kind / kind sets. If this is not a
++      ! QS calculation there is nothing to do.
++      NULLIFY (qs_env)
++      CALL force_env_get(force_env, qs_env=qs_env)
++      IF (.NOT. ASSOCIATED(qs_env)) THEN
++         CPABORT("CHGDATA Ne core correction requires a QS force environment.")
++      END IF
++
++      NULLIFY (cp_subsys)
++      CALL force_env_get(force_env, subsys=cp_subsys)
++      IF (.NOT. ASSOCIATED(cp_subsys)) THEN
++         CPABORT("CHGDATA Ne core correction could not access CP2K subsystem.")
++      END IF
++
++      NULLIFY (atomic_kind_set)
++      NULLIFY (qs_kind_set)
++      NULLIFY (ks_env)
++      CALL get_qs_env(qs_env=qs_env, atomic_kind_set=atomic_kind_set, &
++                      qs_kind_set=qs_kind_set, ks_env=ks_env)
++
++      IF (.NOT. (ASSOCIATED(atomic_kind_set) .AND. ASSOCIATED(qs_kind_set))) THEN
++         CPABORT("CHGDATA Ne core correction could not access CP2K kind sets.")
++      END IF
++
++      nkind = SIZE(atomic_kind_set, 1)
++      found_ne = .FALSE.
++      core_corr_changed = .FALSE.
++      n_ne_atoms = 0
++
++      DO iparticle = 1, cp_subsys%particles%n_els
++         atomic_kind => cp_subsys%particles%els(iparticle)%atomic_kind
++         IF (ASSOCIATED(atomic_kind)) THEN
++            elem = atomic_kind%element_symbol
++            elem = ADJUSTL(elem)
++            IF (TRIM(elem) == 'Ne' .OR. TRIM(elem) == 'NE') THEN
++               n_ne_atoms = n_ne_atoms + 1
++            END IF
++         END IF
++      END DO
++
++      IF (n_ne_atoms <= 0) THEN
++         CPABORT("CHGDATA Ne-electrode mode requested but no Ne atoms were found.")
++      END IF
++
++      delta_q = target_nelect - neutral_electrons_ref
++      core_corr_ne = delta_q/REAL(n_ne_atoms, KIND=dp)
++
++      DO ikind = 1, nkind
++         atomic_kind => atomic_kind_set(ikind)
++         qs_kind => qs_kind_set(ikind)
++
++         ! Identify Ne atomic kinds by their element symbol. Compare against
++         ! the canonical two-character symbol "Ne" (and its fully uppercase
++         ! variant) after left adjustment.
++         elem = atomic_kind%element_symbol
++         elem = ADJUSTL(elem)
++
++         IF (TRIM(elem) == 'Ne' .OR. TRIM(elem) == 'NE') THEN
++            found_ne = .TRUE.
++            NULLIFY (all_potential)
++            NULLIFY (gth_potential)
++            NULLIFY (sgp_potential)
++
++            CALL get_qs_kind(qs_kind, all_potential=all_potential, gth_potential=gth_potential, &
++                             sgp_potential=sgp_potential)
++
++            IF (ASSOCIATED(all_potential)) THEN
++               IF (ABS(all_potential%zeff_correction - core_corr_ne) > core_corr_refresh_tol) THEN
++                  old_zeff = all_potential%zeff
++                  base_zeff = old_zeff - all_potential%zeff_correction
++                  new_zeff = base_zeff + core_corr_ne
++                  IF (ABS(old_zeff) > EPSILON(1.0_dp)) THEN
++                     zeff_scale = new_zeff/old_zeff
++                     all_potential%ccore_charge = all_potential%ccore_charge*zeff_scale
++                  END IF
++                  all_potential%zeff = new_zeff
++                  all_potential%zeff_correction = core_corr_ne
++                  core_corr_changed = .TRUE.
++               END IF
++            END IF
++            IF (ASSOCIATED(gth_potential)) THEN
++               IF (ABS(gth_potential%zeff_correction - core_corr_ne) > core_corr_refresh_tol) THEN
++                  old_zeff = gth_potential%zeff
++                  base_zeff = old_zeff - gth_potential%zeff_correction
++                  new_zeff = base_zeff + core_corr_ne
++                  IF (ABS(old_zeff) > EPSILON(1.0_dp)) THEN
++                     zeff_scale = new_zeff/old_zeff
++                     gth_potential%ccore_charge = gth_potential%ccore_charge*zeff_scale
++                     gth_potential%cerf_ppl = gth_potential%cerf_ppl*zeff_scale
++                  END IF
++                  gth_potential%zeff = new_zeff
++                  gth_potential%zeff_correction = core_corr_ne
++                  core_corr_changed = .TRUE.
++               END IF
++            END IF
++            IF (ASSOCIATED(sgp_potential)) THEN
++               IF (ABS(sgp_potential%zeff_correction - core_corr_ne) > core_corr_refresh_tol) THEN
++                  old_zeff = sgp_potential%zeff
++                  base_zeff = old_zeff - sgp_potential%zeff_correction
++                  new_zeff = base_zeff + core_corr_ne
++                  IF (ABS(old_zeff) > EPSILON(1.0_dp)) THEN
++                     zeff_scale = new_zeff/old_zeff
++                     sgp_potential%ccore_charge = sgp_potential%ccore_charge*zeff_scale
++                  END IF
++                  sgp_potential%zeff = new_zeff
++                  sgp_potential%zeff_correction = core_corr_ne
++                  core_corr_changed = .TRUE.
++               END IF
++            END IF
++         END IF
++      END DO
++
++      IF (.NOT. found_ne) THEN
++         CPABORT("CHGDATA Ne core correction requested but no Ne atomic kind was found.")
++      END IF
++
++      output_unit = cp_logger_get_default_io_unit()
++      IF (output_unit > 0) THEN
++         WRITE (output_unit, *) " @ DRIVER MODE: Ne-electrode CHGDATA target_nelect = ", target_nelect, &
++            " neutral_electrons = ", neutral_electrons_ref
++         WRITE (output_unit, *) " @ DRIVER MODE: Ne atoms = ", n_ne_atoms, &
++            " CORE_CORRECTION per Ne = ", core_corr_ne
++         IF (.NOT. core_corr_changed) THEN
++            WRITE (output_unit, *) " @ DRIVER MODE: Ne CORE_CORRECTION refresh skipped; change <= ", &
++               core_corr_refresh_tol
++         END IF
++      END IF
++
++      IF (core_corr_changed) THEN
++         CALL get_qs_kind_set(qs_kind_set, total_zeff_corr=qs_env%total_zeff_corr)
++      END IF
++
++      IF (core_corr_changed .AND. ASSOCIATED(ks_env)) THEN
++         CALL set_ks_env(ks_env, potential_changed=.TRUE., &
++                         forces_up_to_date=.FALSE.)
++      END IF
++
++      CALL timestop(handle)
++
++   END SUBROUTINE apply_ne_core_correction
++
+ END MODULE ipi_driver
+diff --git a/src/qs_scf_post_gpw.F b/src/qs_scf_post_gpw.F
+index 6f8b190..a15b095 100644
+--- a/src/qs_scf_post_gpw.F
++++ b/src/qs_scf_post_gpw.F
+@@ -13,6 +13,7 @@
+ !> \author Joost VandeVondele (10.2003)
+ ! **************************************************************************************************
+ MODULE qs_scf_post_gpw
++   USE IEEE_ARITHMETIC,                 ONLY: IEEE_IS_FINITE
+    USE admm_types,                      ONLY: admm_type
+    USE admm_utils,                      ONLY: admm_correct_for_eigenvalues,&
+                                               admm_uncorrect_for_eigenvalues
+@@ -96,6 +97,7 @@ MODULE qs_scf_post_gpw
+    USE particle_list_types,             ONLY: particle_list_type
+    USE particle_types,                  ONLY: particle_type
+    USE physcon,                         ONLY: angstrom,&
++                                              bohr,&
+                                               evolt
+    USE population_analyses,             ONLY: lowdin_population_analysis,&
+                                               mulliken_population_analysis
+@@ -209,14 +211,159 @@ MODULE qs_scf_post_gpw
+    ! Global parameters
+    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_scf_post_gpw'
+    PUBLIC :: scf_post_calculation_gpw, &
++             ipi_workfunction_get_average, &
++             ipi_workfunction_set_region, &
+              qs_scf_post_moments, &
+              write_mo_dependent_results, &
+              write_mo_free_results
+ 
+    PUBLIC :: make_lumo_gpw
+ 
++   LOGICAL, PRIVATE :: ipi_workfunction_available = .FALSE.
++   LOGICAL, PRIVATE :: ipi_workfunction_enabled = .FALSE.
++   REAL(KIND=dp), PRIVATE :: ipi_workfunction_v_avg_hartree = 0.0_dp
++   INTEGER, PRIVATE :: ipi_workfunction_axis = 3
++   REAL(KIND=dp), PRIVATE :: ipi_workfunction_max_A = -1.0_dp
++   REAL(KIND=dp), PRIVATE :: ipi_workfunction_min_A = -1.0_dp
++
+ CONTAINS
+ 
++! **************************************************************************************************
++!> \brief Enable/disable the i-PI lattice-axis planar-potential averaging region.
++! **************************************************************************************************
++   SUBROUTINE ipi_workfunction_set_region(axis, minimum_A, maximum_A)
++      INTEGER, INTENT(IN)                                :: axis
++      REAL(KIND=dp), INTENT(IN)                          :: minimum_A, maximum_A
++
++      IF (axis < 1 .OR. axis > 3) CPABORT("CP2K i-PI potential_average_axis must be x, y, or z.")
++      ipi_workfunction_axis = axis
++      ipi_workfunction_min_A = minimum_A
++      ipi_workfunction_max_A = maximum_A
++      ipi_workfunction_enabled = maximum_A > minimum_A
++      ipi_workfunction_available = .FALSE.
++      ipi_workfunction_v_avg_hartree = 0.0_dp
++   END SUBROUTINE ipi_workfunction_set_region
++
++! **************************************************************************************************
++!> \brief Return the latest cube-equivalent planar Hartree-potential average.
++! **************************************************************************************************
++   SUBROUTINE ipi_workfunction_get_average(v_avg_hartree, available)
++      REAL(KIND=dp), INTENT(OUT)                         :: v_avg_hartree
++      LOGICAL, INTENT(OUT)                               :: available
++
++      v_avg_hartree = ipi_workfunction_v_avg_hartree
++      available = ipi_workfunction_available
++   END SUBROUTINE ipi_workfunction_get_average
++
++! **************************************************************************************************
++!> \brief Update the i-PI workfunction cache from the cube-equivalent Hartree grid.
++! **************************************************************************************************
++   SUBROUTINE ipi_workfunction_update_from_vhartree(v_hartree_rspace, para_env)
++      TYPE(pw_r3d_rs_type), POINTER                      :: v_hartree_rspace
++      TYPE(mp_para_env_type), POINTER                    :: para_env
++
++      INTEGER                                            :: axis, grid_index, ix, iy, iz
++      INTEGER, DIMENSION(2, 3)                           :: bounds_global, bounds_local
++      REAL(KIND=dp) :: cell_hmat(3, 3), coordinate_bohr, cross_product(3), face_norm, height_bohr, &
++         local_count, local_sum, maximum_bohr, minimum_bohr, udvol
++
++      IF (.NOT. ipi_workfunction_enabled) RETURN
++      IF (.NOT. ASSOCIATED(para_env)) THEN
++         CPABORT("CP2K i-PI workfunction cache could not access para_env.")
++      END IF
++      IF (.NOT. ASSOCIATED(v_hartree_rspace)) THEN
++         CPABORT("CP2K i-PI workfunction cache could not access the Hartree potential grid.")
++      END IF
++      IF (.NOT. ASSOCIATED(v_hartree_rspace%array)) THEN
++         CPABORT("CP2K i-PI workfunction cache found an unallocated Hartree potential grid.")
++      END IF
++      IF (.NOT. ASSOCIATED(v_hartree_rspace%pw_grid)) THEN
++         CPABORT("CP2K i-PI workfunction cache found a Hartree potential grid without metadata.")
++      END IF
++      IF (v_hartree_rspace%pw_grid%dvol <= 0.0_dp) THEN
++         CPABORT("CP2K i-PI workfunction cache found an invalid Hartree potential grid volume.")
++      END IF
++
++      axis = ipi_workfunction_axis
++      minimum_bohr = ipi_workfunction_min_A*bohr
++      maximum_bohr = ipi_workfunction_max_A*bohr
++      IF (axis < 1 .OR. axis > 3) THEN
++         CPABORT("CP2K i-PI workfunction cache received an invalid averaging axis.")
++      END IF
++      IF (maximum_bohr <= minimum_bohr) THEN
++         CPABORT("CP2K i-PI workfunction cache requires potential_average_max_A > min_A.")
++      END IF
++
++      cell_hmat(:, 1) = v_hartree_rspace%pw_grid%dh(:, 1)* &
++                        REAL(v_hartree_rspace%pw_grid%npts(1), KIND=dp)
++      cell_hmat(:, 2) = v_hartree_rspace%pw_grid%dh(:, 2)* &
++                        REAL(v_hartree_rspace%pw_grid%npts(2), KIND=dp)
++      cell_hmat(:, 3) = v_hartree_rspace%pw_grid%dh(:, 3)* &
++                        REAL(v_hartree_rspace%pw_grid%npts(3), KIND=dp)
++      SELECT CASE (axis)
++      CASE (1)
++         cross_product(1) = cell_hmat(2, 2)*cell_hmat(3, 3) - cell_hmat(3, 2)*cell_hmat(2, 3)
++         cross_product(2) = cell_hmat(3, 2)*cell_hmat(1, 3) - cell_hmat(1, 2)*cell_hmat(3, 3)
++         cross_product(3) = cell_hmat(1, 2)*cell_hmat(2, 3) - cell_hmat(2, 2)*cell_hmat(1, 3)
++      CASE (2)
++         cross_product(1) = cell_hmat(2, 3)*cell_hmat(3, 1) - cell_hmat(3, 3)*cell_hmat(2, 1)
++         cross_product(2) = cell_hmat(3, 3)*cell_hmat(1, 1) - cell_hmat(1, 3)*cell_hmat(3, 1)
++         cross_product(3) = cell_hmat(1, 3)*cell_hmat(2, 1) - cell_hmat(2, 3)*cell_hmat(1, 1)
++      CASE (3)
++         cross_product(1) = cell_hmat(2, 1)*cell_hmat(3, 2) - cell_hmat(3, 1)*cell_hmat(2, 2)
++         cross_product(2) = cell_hmat(3, 1)*cell_hmat(1, 2) - cell_hmat(1, 1)*cell_hmat(3, 2)
++         cross_product(3) = cell_hmat(1, 1)*cell_hmat(2, 2) - cell_hmat(2, 1)*cell_hmat(1, 2)
++      END SELECT
++      face_norm = SQRT(SUM(cross_product**2))
++      IF (.NOT. IEEE_IS_FINITE(face_norm) .OR. face_norm <= 0.0_dp) THEN
++         CPABORT("CP2K i-PI workfunction cache found a singular cell face.")
++      END IF
++      height_bohr = v_hartree_rspace%pw_grid%vol/face_norm
++      IF (.NOT. IEEE_IS_FINITE(height_bohr) .OR. height_bohr <= 0.0_dp) THEN
++         CPABORT("CP2K i-PI workfunction cache found an invalid cell height.")
++      END IF
++      IF (minimum_bohr < -1.0e-10_dp .OR. maximum_bohr > height_bohr + 1.0e-10_dp) THEN
++         CPABORT("CP2K i-PI potential_average_region lies outside the selected cell height.")
++      END IF
++
++      udvol = 1.0_dp/v_hartree_rspace%pw_grid%dvol
++      local_sum = 0.0_dp
++      local_count = 0.0_dp
++
++      bounds_global = v_hartree_rspace%pw_grid%bounds
++      bounds_local = v_hartree_rspace%pw_grid%bounds_local
++
++      DO iz = bounds_local(1, 3), bounds_local(2, 3)
++         DO iy = bounds_local(1, 2), bounds_local(2, 2)
++            DO ix = bounds_local(1, 1), bounds_local(2, 1)
++               SELECT CASE (axis)
++               CASE (1)
++                  grid_index = ix - bounds_global(1, 1)
++               CASE (2)
++                  grid_index = iy - bounds_global(1, 2)
++               CASE (3)
++                  grid_index = iz - bounds_global(1, 3)
++               END SELECT
++               coordinate_bohr = REAL(grid_index, KIND=dp)/ &
++                                 REAL(v_hartree_rspace%pw_grid%npts(axis), KIND=dp)*height_bohr
++               IF (coordinate_bohr >= minimum_bohr .AND. coordinate_bohr <= maximum_bohr) THEN
++                  local_sum = local_sum + v_hartree_rspace%array(ix, iy, iz)*udvol
++                  local_count = local_count + 1.0_dp
++               END IF
++            END DO
++         END DO
++      END DO
++
++      CALL para_env%sum(local_sum)
++      CALL para_env%sum(local_count)
++      IF (local_count <= 0.0_dp) THEN
++         CPABORT("CP2K i-PI workfunction cache found no grid points in the requested region.")
++      END IF
++
++      ipi_workfunction_v_avg_hartree = local_sum/local_count
++      ipi_workfunction_available = .TRUE.
++   END SUBROUTINE ipi_workfunction_update_from_vhartree
++
+ ! **************************************************************************************************
+ !> \brief collects possible post - scf calculations and prints info / computes properties.
+ !> \param qs_env the qs_env in which the qs_env lives
+@@ -2449,6 +2596,11 @@ CONTAINS
+          CALL energy_windows(qs_env)
+       END IF
+ 
++      IF (ipi_workfunction_enabled) THEN
++         CALL get_qs_env(qs_env=qs_env, v_hartree_rspace=v_hartree_rspace)
++         CALL ipi_workfunction_update_from_vhartree(v_hartree_rspace, para_env)
++      END IF
++
+       ! Print the hartree potential
+       IF (BTEST(cp_print_key_should_output(logger%iter_info, input, &
+                                            "DFT%PRINT%V_HARTREE_CUBE"), cp_p_file)) THEN
+diff --git a/src/start/input_cp2k_motion.F b/src/start/input_cp2k_motion.F
+index 46bac74..bfc6113 100644
+--- a/src/start/input_cp2k_motion.F
++++ b/src/start/input_cp2k_motion.F
+@@ -1604,7 +1604,7 @@ CONTAINS
+       CALL section_create(section, __LOCATION__, name="DRIVER", &
+                           description="This section defines the parameters needed to run in i-PI driver mode.", &
+                           citations=[Ceriotti2014, Kapil2016], &
+-                          n_keywords=3, n_subsections=0, repeats=.FALSE.)
++                          n_keywords=4, n_subsections=0, repeats=.FALSE.)
+ 
+       NULLIFY (keyword)
+       CALL keyword_create(keyword, __LOCATION__, name="unix", &

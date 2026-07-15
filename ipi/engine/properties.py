@@ -963,32 +963,37 @@ class Properties:
             },
             "electronic_charge": {
                 "dimension": "number",
-                "help": "The current electronic charge for constant potential simulations.",
+                "help": "Current total electron number.",
                 "func": self.get_electronic_charge,
             },
             "fermi_level": {
                 "dimension": "energy",
-                "help": "The current Fermi level for constant potential simulations.",
+                "help": "Current Fermi level.",
                 "func": self.get_fermi_level,
             },
             "fermi_level_target": {
                 "dimension": "energy",
-                "help": "The target Fermi level for constant potential simulations.",
+                "help": "Current target Fermi level.",
                 "func": self.get_fermi_level_target,
             },
             "workfunction": {
                 "dimension": "energy",
-                "help": "The current work function for constant workfunction simulations.",
+                "help": "Current workfunction.",
                 "func": self.get_workfunction,
+            },
+            "workfunction_steps_average": {
+                "dimension": "energy",
+                "help": "Restartable Ne-electrode workfunction moving average.",
+                "func": self.get_workfunction_steps_average,
             },
             "workfunction_target": {
                 "dimension": "energy",
-                "help": "The target work function for constant workfunction simulations.",
+                "help": "Current target workfunction.",
                 "func": self.get_workfunction_target,
             },
             "Grand_canonical_potential": {
                 "dimension": "energy",
-                "help": "Grand canonical potential for constant potential simulations (E - mu/phi * net electrons).",
+                "help": "Grand-canonical ensemble energy.",
                 "func": self.get_grand_canonical_potential,
             },
         }
@@ -1048,7 +1053,7 @@ class Properties:
            the property specified by the keyword key.
         """
 
-        (key, unit, arglist, kwarglist) = getall(key)
+        key, unit, arglist, kwarglist = getall(key)
         pkey = self.property_dict[key]
 
         # pkey["func"](*arglist,**kwarglist) gives the value of the property
@@ -2323,7 +2328,7 @@ class Properties:
             if ni == 1:
                 law = -logr
             else:
-                (law, drop) = logsumlog((law, 1.0), (-logr, 1.0))
+                law, drop = logsumlog((law, 1.0), (-logr, 1.0))
 
             # here we need to take care of the sign of tcv, which might as well be
             # negative... almost never but...
@@ -2331,7 +2336,7 @@ class Properties:
                 lawke = -logr + np.log(abs(tcv))
                 sawke = np.sign(tcv)
             else:
-                (lawke, sawke) = logsumlog(
+                lawke, sawke = logsumlog(
                     (lawke, sawke), (-logr + np.log(abs(tcv)), np.sign(tcv))
                 )
 
@@ -2431,7 +2436,7 @@ class Properties:
             if ni == 1:
                 law = -logr
             else:
-                (law, drop) = logsumlog((law, 1.0), (-logr, 1.0))
+                law, drop = logsumlog((law, 1.0), (-logr, 1.0))
 
             # here we need to take care of the sign of tcv, which might as well be
             # negative... almost never but...
@@ -2439,7 +2444,7 @@ class Properties:
                 lawke = -logr + np.log(abs(tcv))
                 sawke = np.sign(tcv)
             else:
-                (lawke, sawke) = logsumlog(
+                lawke, sawke = logsumlog(
                     (lawke, sawke), (-logr + np.log(abs(tcv)), np.sign(tcv))
                 )
 
@@ -2521,7 +2526,9 @@ class Properties:
 
         spraverage = sprsum / ni
         spr2average = spr2sum / ni
-        sprexpaverage = sprexpsum / ni
+
+        free_particle_factor = alpha ** (1.5 * (self.beads.nbeads - 1))
+        sprexpaverage = (sprexpsum / ni) * free_particle_factor
 
         return np.asarray([spraverage, spr2average, sprexpaverage])
 
@@ -2703,8 +2710,19 @@ class Properties:
                 "Couldn't find an atom which matched the argument of isotope_zetatd"
             )
 
+        free_particle_factor = alpha ** (1.5 * (self.beads.nbeads - 1))
+        # This is the ratio of factors that comes from the integral of kinetic energy of the beads in the Boltzmann factor
+        # which is ( \frac{mP}{2\pi\beta\hbar^2})^{3P/2}
+        # we have also removed the centroid mode contribution to the ratio, as it is irrelevant here.
+
         return np.asarray(
-            [tdsum / ni, td2sum / ni, tdexpsum / ni, tiexpsum / ni, chinexpsum / ni]
+            [
+                tdsum / ni,
+                td2sum / ni,
+                (tdexpsum / ni) * free_particle_factor,
+                (tiexpsum / ni) * free_particle_factor,
+                (chinexpsum / ni) * free_particle_factor,
+            ]
         )
 
     def get_isotope_zetasc_4th(self, alpha="1.0", atom=""):
@@ -2927,114 +2945,60 @@ class Properties:
             raise Exception("No bosons found for fermionic_sign")
         return self.nm.exchange_potential.fermionic_sign
 
+    def _require_electronic_state(self, property_name):
+        state = getattr(self.motion, "electronic_state", None)
+        if state is None:
+            raise RuntimeError(
+                f"Property '{property_name}' requires <electrons enabled='true'>."
+            )
+        return state
+
     def get_electronic_charge(self):
-        """Returns the current electronic charge for constant potential simulations."""
-        if hasattr(self.motion, 'electronic_state') and self.motion.electronic_state is not None:
-            return self.motion.electronic_state.q
-        else:
-            return 0.0
-
-    def get_workfunction_target(self):
-        """Returns the target work function for constant workfunction simulations.
-
-        This reads the target value configured in the electronic state when
-        running in workfunction mode. The value is in internal units
-        (Hartree) and will be converted by the output layer.
-        """
-        if (
-            hasattr(self.motion, "electronic_state")
-            and self.motion.electronic_state is not None
-            and hasattr(self.motion.electronic_state, "target_workfunction")
-        ):
-            return self.motion.electronic_state.target_workfunction
-        else:
-            return 0.0
+        return self._require_electronic_state("electronic_charge").q
 
     def get_fermi_level(self):
-        """Returns the current Fermi level for constant potential simulations."""
-        if hasattr(self.motion, 'electronic_state') and self.motion.electronic_state is not None:
-            return self.motion.electronic_state.current_ef
-        else:
-            return 0.0
+        return self._require_electronic_state("fermi_level").current_ef
 
     def get_fermi_level_target(self):
-        """Returns the target Fermi level for constant potential simulations."""
-        if hasattr(self.motion, 'electronic_state') and self.motion.electronic_state is not None:
-            return self.motion.electronic_state.target_ef
-        else:
-            return 0.0
-    
-    def get_workfunction(self):
-        """Returns the current work function for constant workfunction simulations.
+        state = self._require_electronic_state("fermi_level_target")
+        if state.mode != "fermi":
+            raise RuntimeError("fermi_level_target requires Fermi-level control.")
+        return state.target_ef
 
-        The value is returned in internal energy units (Hartree) and will be
-        converted to the requested user units (e.g. eV) by the output layer.
-        """
-        if (
-            hasattr(self.motion, "electronic_state")
-            and self.motion.electronic_state is not None
-            and hasattr(self.motion.electronic_state, "current_workfunction")
-        ):
-            return self.motion.electronic_state.current_workfunction
-        else:
-            return 0.0
+    def get_workfunction(self):
+        state = self._require_electronic_state("workfunction")
+        if state.mode != "workfunction":
+            raise RuntimeError("workfunction requires workfunction control.")
+        return state.current_workfunction
+
+    def get_workfunction_steps_average(self):
+        state = self._require_electronic_state("workfunction_steps_average")
+        if state.mode != "workfunction":
+            raise RuntimeError(
+                "workfunction_steps_average requires workfunction control."
+            )
+        return state.current_workfunction_steps_average
+
+    def get_workfunction_target(self):
+        state = self._require_electronic_state("workfunction_target")
+        if state.mode != "workfunction":
+            raise RuntimeError("workfunction_target requires workfunction control.")
+        return state.target_workfunction
 
     def get_grand_canonical_potential(self):
-        """Returns the grand canonical potential for constant potential simulations.
+        """Return the physically signed grand-canonical potential."""
 
-        For constant Fermi level simulations (mode='fermi'):
-
-            Omega = E_reg - mu * (N - N_neutral)
-
-        For constant workfunction simulations (mode='workfunction'):
-
-            Omega = E_reg - phi * (N - N_neutral)
-
-        where E_reg is the regular (canonical) system energy as returned by
-        the 'potential' property (already lambda-mixed by FFMixTwoSockets),
-        N is the current electronic charge q, and N_neutral is the neutral
-        electron count provided via neutral_electrons.
-        All energies are in internal units (Hartree).
-        """
-
-        # Base regular energy: same quantity used for the 'potential' property
-        try:
-            E_reg = self.get_pot()
-        except Exception:
-            # If potential cannot be obtained, fall back to zero
-            E_reg = 0.0
-
-        # If no electronic state is present, just return the regular energy
-        es = getattr(self.motion, "electronic_state", None)
-        if es is None:
-            return E_reg
-
-        # Current electron number q
-        N_current = getattr(es, "q", None)
-        if N_current is None:
-            return E_reg
-
-        # Neutral electron number: obtained from electronic_state.neutral_electrons
-        neutral_electrons = getattr(es, "neutral_electrons", None)
-        if neutral_electrons is None:
-            return E_reg
-
-        net_electrons = float(N_current) - float(neutral_electrons)
-        if abs(net_electrons) < 1e-12:
-            # No net excess charge: grand canonical potential reduces to canonical energy
-            return E_reg
-
-        mode = getattr(es, "mode", "fermi")
-        if mode == "workfunction":
-            X = getattr(es, "current_workfunction", None)
-        else:
-            X = getattr(es, "current_ef", None)
-
-        if X is None:
-            return E_reg
-
-        # Omega = E_reg - X * net_electrons (all in Hartree)
-        return E_reg - float(X) * net_electrons
+        state = self._require_electronic_state("Grand_canonical_potential")
+        neutral = getattr(state, "neutral_electrons", None)
+        if neutral is None or int(neutral) <= 0:
+            raise RuntimeError(
+                "Grand_canonical_potential requires positive neutral_electrons."
+            )
+        excess = state.q - float(neutral)
+        energy = self.get_pot()
+        if state.mode == "workfunction":
+            return energy + state.target_workfunction * excess
+        return energy - state.target_ef * excess
 
 
 class Trajectories:
@@ -3476,7 +3440,7 @@ class Trajectories:
            the trajectory specified by the keyword key.
         """
 
-        (key, unit, arglist, kwarglist) = getall(key)
+        key, unit, arglist, kwarglist = getall(key)
         pkey = self.traj_dict[key]
 
         # pkey["func"](*arglist,**kwarglist) gives the value of the trajectory

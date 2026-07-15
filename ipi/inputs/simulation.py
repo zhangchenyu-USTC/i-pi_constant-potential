@@ -22,7 +22,6 @@ import ipi.engine.forcefields as eforcefields
 import ipi.inputs.outputs as ioutputs
 from ipi.inputs.smotion import InputSmotion
 
-
 __all__ = ["InputSimulation"]
 
 
@@ -163,6 +162,10 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
             iforcefields.InputFFDirect,
             {"help": iforcefields.InputFFDirect.default_help},
         ),
+        "ffmpi": (
+            iforcefields.InputFFMPI,
+            {"help": iforcefields.InputFFMPI.default_help},
+        ),
         "fflj": (
             iforcefields.InputFFLennardJones,
             {"help": iforcefields.InputFFLennardJones.default_help},
@@ -241,7 +244,11 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
         self.mode.store(simul.mode)
         self.safe_stride.store(simul.safe_stride)
 
-        _fflist = [v for k, v in sorted(simul.fflist.items())]
+        _fflist = [
+            value
+            for _, value in sorted(simul.fflist.items())
+            if not getattr(value, "_is_charge_mixing_wrapper", False)
+        ]
         if len(self.extra) != len(_fflist) + len(simul.syslist):
             self.extra = [0] * (len(_fflist) + len(simul.syslist))
 
@@ -258,6 +265,10 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
                     _iobj = iforcefields.InputFFDirect()
                     _iobj.store(_obj)
                     self.extra[_ii] = ("ffdirect", _iobj)
+                elif isinstance(_obj, eforcefields.FFMPI):
+                    _iobj = iforcefields.InputFFMPI()
+                    _iobj.store(_obj)
+                    self.extra[_ii] = ("ffmpi", _iobj)
                 elif isinstance(_obj, eforcefields.FFLennardJones):
                     _iobj = iforcefields.InputFFLennardJones()
                     _iobj.store(_obj)
@@ -294,14 +305,6 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
                     _iobj = iforcefields.InputFFCavPhSocket()
                     _iobj.store(_obj)
                     self.extra[_ii] = ("ffcavphsocket", _iobj)
-                elif isinstance(_obj, eforcefields.FFMixTwoSockets):
-                    # Store mixed two-endpoint CP2K backends via the unified
-                    # <ffsocket> tag using InputFFSocket with charge='true'
-                    # and mixing='true', so that restart files do not rely on
-                    # the legacy <ffmixtwosockets> element.
-                    _iobj = iforcefields.InputFFSocket()
-                    _iobj.store(_obj)
-                    self.extra[_ii] = ("ffsocket", _iobj)
                 elif isinstance(_obj, System):
                     _iobj = InputSystem()
                     _iobj.store(_obj)
@@ -349,6 +352,7 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
             elif k in [
                 "ffsocket",
                 "ffdirect",
+                "ffmpi",
                 "fflj",
                 "ffdebye",
                 "ffdmd",
@@ -360,14 +364,9 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
                 "ffcavphsocket",
             ]:
                 new_ff = v.fetch()
-                if k == "ffsocket":
-                    # overrides ffsocket prefix when the forcefield exposes a
-                    # low-level socket interface (e.g. plain FFSocket). Some
-                    # backends created via <ffsocket> (such as FFMixTwoSockets)
-                    # do not have a .socket attribute and manage their own
-                    # socket layer, so we skip prefix assignment in that case.
-                    if hasattr(new_ff, "socket"):
-                        new_ff.socket.sockets_prefix = self.sockets_prefix.fetch()
+                if k in ["ffsocket", "ffcavphsocket"]:
+                    # overrides ffsocket and ffcavsocket prefix - important if no access to /tmp in machines
+                    new_ff.socket.sockets_prefix = self.sockets_prefix.fetch()
                 fflist.append(new_ff)
 
         # this creates a simulation object which gathers all the little bits

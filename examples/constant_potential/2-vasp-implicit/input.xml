@@ -1,0 +1,66 @@
+<simulation verbosity="low">
+  <output prefix="simulation">
+    <properties stride="1" filename="out">[step, time{femtosecond}, potential{electronvolt}, conserved{electronvolt},temperature{kelvin}, electronic_charge,fermi_level{electronvolt}, workfunction{electronvolt},workfunction_target{electronvolt}, Grand_canonical_potential{electronvolt}]</properties>
+    <trajectory filename="positions" stride="1" format="xyz" cell_units="angstrom">positions{angstrom}</trajectory>
+    <checkpoint filename="restart" stride="1" overwrite="True"/>
+  </output>
+  <total_steps>100</total_steps>
+  <prng>
+    <seed>31245</seed>
+  </prng>
+
+  <ffsocket name="vasp_implicit" mode="inet" pbc="true">
+    <address>localhost</address>
+    <port>17000</port>
+    <timeout>20000</timeout>
+    <consolidate_messages>true</consolidate_messages>
+    <batch_size>1</batch_size>
+  </ffsocket>
+
+  <system>
+    <initialize nbeads="1">
+      <file mode="xyz" units="angstrom">init.xyz</file>
+      <cell mode="manual" units="angstrom">[14.7600002289, -7.3800001144, 0.0, 0.0, 12.7825351581, 0.0, 0.0, 0.0, 30.0]</cell>
+      <velocities mode="thermal" units="kelvin">300.0</velocities>
+    </initialize>
+	
+    <forces>
+	  <force forcefield="vasp_implicit"/>
+	</forces>
+	
+    <ensemble>
+	  <temperature units="kelvin">300.0</temperature>
+	</ensemble>
+	
+    <motion mode="dynamics">
+      <dynamics mode="nvt" splitting="baoab">
+        <timestep units="femtosecond">0.5</timestep>
+        <thermostat mode="svr"><tau units="femtosecond">200.0</tau></thermostat>
+		
+        <!-- Enable the system-level electronic coordinate q for constant-potential dynamics. -->
+        <electrons enabled="true">
+          <target_workfunction units="electronvolt">3.6</target_workfunction>
+          <!-- Axis along which the driver constructs the planar-averaged reference potential. -->
+          <potential_average_axis>z</potential_average_axis>
+          <!-- Range of vacuum electrostatic potential value; it must lie inside the intended vacuum/solvent plateau. -->
+          <potential_average_region units="angstrom">[20.0, 25.0]</potential_average_region>
+          <neutral_electrons>663</neutral_electrons>
+          <!-- Initial total electron number q. -->
+          <q_init>663.0</q_init>
+          <!-- Fictitious inertia of q; this controls electronic-coordinate dynamics, not a physical electron mass. -->
+          <mass units="atomic_unit">400.0</mass>
+          <!-- Recompute the complete implicit-solvent response at steps 0, 5, 10, ...; q is updated every step. -->
+          <solvation_update_stride>5</solvation_update_stride>
+          <!-- SVR thermostat for q and its conjugate momentum. -->
+          <potentiostat mode="svr">
+            <!-- Relaxation time of the electronic SVR thermostat. -->
+            <tau units="femtosecond">200.0</tau>
+            <!-- Physical target temperature of the electronic coordinate. -->
+            <temp units="kelvin">300.0</temp>
+          </potentiostat>
+        </electrons>
+		
+      </dynamics>
+    </motion>
+  </system>
+</simulation>

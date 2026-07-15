@@ -1,0 +1,22 @@
+&GLOBAL
+  PROGRAM FARMING
+  PROJECT cp2k
+  RUN_TYPE NONE
+&END GLOBAL
+
+&FARMING
+  GROUP_PARTITION 32 32
+  MAX_JOBS_PER_GROUP 1
+
+  &JOB
+    DIRECTORY cp2k_high
+    INPUT_FILE_NAME cp2k_high.inp
+    OUTPUT_FILE_NAME cp2k_high.out
+  &END JOB
+  
+  &JOB
+    DIRECTORY cp2k_low
+    INPUT_FILE_NAME cp2k_low.inp
+    OUTPUT_FILE_NAME cp2k_low.out
+  &END JOB
+&END FARMING

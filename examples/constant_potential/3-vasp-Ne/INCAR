@@ -1,0 +1,33 @@
+System
+
+LREAL = Auto
+ENCUT = 400
+PREC  = Normal
+ALGO  = V
+ISYM = 0
+
+NELM   = 500
+NELMIN = 5
+EDIFF  = 1E-5
+EDIFFG = -0.02
+
+ISPIN  = 1
+ISMEAR = 1
+SIGMA = 0.2
+IVDW   = 11
+LDIPOL = .TRUE.
+IDIPOL = 3
+NCORE = 4
+
+LWAVE  = .FALSE.
+LCHARG = .FALSE.
+LPLANE = .TRUE.
+LSCALU = .FALSE.
+LASPH  = .TRUE.
+ADDGRID= .TRUE.
+LVHAR  = .FALSE.
+
+IBRION = 24
+IHOST  = localhost
+PORT   = 17004
+INET   = 1

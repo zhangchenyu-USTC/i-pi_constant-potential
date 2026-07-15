@@ -17,9 +17,9 @@ from copy import deepcopy
 
 from ipi.utils.depend import depend_value, dpipe, dproperties
 from ipi.utils.io.inputs.io_xml import xml_parse_file, xml_parse_string, xml_write
+from ipi.utils.io.inputs.io_json import json_parse_file, json_parse_string
 from ipi.utils.messages import verbosity, info, warning, banner
 from ipi.utils.softexit import softexit
-from ipi.utils.units import Constants
 import ipi.engine.outputs as eoutputs
 import ipi.inputs.simulation as isimulation
 import threading
@@ -66,6 +66,7 @@ class Simulation:
         sockets_prefix=None,
         request_banner=False,
         read_only=False,
+        post_init_hook=None,
     ):
         """Load an XML input file and return a `Simulation` object.
 
@@ -76,11 +77,32 @@ class Simulation:
             request_banner (bool): Whether to print the i-PI banner,
                 if verbosity is higher than 'quiet'.
             sockets_prefix (str): Use the specified prefix for all Unix domain sockets.
+            read_only (bool): If set to true, it creates the simulation object but
+                doesn't initialize/open the sockets or start the output threads.
+            post_init_hook (function): If provided, this function is called
+                after the simulation object is created, with the simulation object
+                as the only argument. This can be used to modify the simulation
+                before it is bound and started.
         """
 
         # parse the file
         if type(xml_input) is str:
-            xmlrestart = xml_parse_string(xml_input)
+            try:
+                xmlrestart = json_parse_string(xml_input)
+            except ValueError as json_err:
+                try:
+                    xmlrestart = xml_parse_string(xml_input)
+                except Exception as xml_err:
+                    raise ValueError(
+                        "Input is neither valid JSON nor valid XML. "
+                        f"JSON error: {json_err}; XML error: {xml_err}"
+                    )
+        elif (
+            hasattr(xml_input, "name")
+            and isinstance(xml_input.name, str)
+            and xml_input.name.endswith(".json")
+        ):
+            xmlrestart = json_parse_file(xml_input)
         else:
             xmlrestart = xml_parse_file(xml_input)
 
@@ -113,6 +135,10 @@ class Simulation:
             print(" --- begin input file content ---")
             print(xml_write(xmlrestart))
             print(" ---  end input file content  ---")
+
+        # call any post-initialization hook
+        if post_init_hook is not None:
+            post_init_hook(simulation)
 
         # pipe between the components of the simulation
         simulation.bind(read_only)
@@ -190,9 +216,17 @@ class Simulation:
 
         self.chk = None
         self.rollback = True
+        self.finished = False
+        self.exit_status = "success"
+        self.exit_message = " @ SIMULATION: Exiting cleanly."
 
     def bind(self, read_only=False):
-        """Calls the bind routines for all the objects in the simulation."""
+        """Calls the bind routines for all the objects in the simulation.
+
+        Args:
+            read_only: If set to true, it creates the simulation object but
+                doesn't initialize/open the sockets or start the output threads.
+        """
 
         if self.tsteps <= self.step:
             raise ValueError(
@@ -299,21 +333,8 @@ class Simulation:
 
         # prints inital configuration -- only if we are not restarting
         if self.step == 0 and write_outputs:
-            # Step 0 optimization: Update Fermi level before initial output
-            self._update_initial_fermi_levels()
-
-            # Give forcefields (e.g. FFCPVasp) a chance to post-process the
-            # just-computed forces/extras and initialize any caches or
-            # derived quantities (such as workfunction) needed for step 0
-            # output. This does not trigger new force evaluations because
-            # positions/cell have not changed since the last force
-            # calculation.
-            for k, f in self.fflist.items():
-                try:
-                    f.update()
-                except Exception:
-                    continue
-
+            self._initialize_constant_potential_observables()
+            self._update_constant_potential_forcefields()
             self.step = -1
             # must use multi-threading to avoid blocking in multi-system runs with WTE
             if self.threading:
@@ -344,7 +365,7 @@ class Simulation:
             # exit requests without screwing the trajectory
 
             steptime = -time.time()
-            if softexit.triggered:
+            if softexit.triggered or self.finished:
                 break
 
             # save a consistent state of the simulation that will be saved as a RESTART file in case of premature (soft) exit
@@ -353,7 +374,7 @@ class Simulation:
 
             self.run_step(self.step)
 
-            if softexit.triggered:
+            if softexit.triggered or self.finished:
                 # Don't write if we are about to exit.
                 break
 
@@ -418,71 +439,60 @@ class Simulation:
             for s in self.syslist:
                 # creates separate threads for the different systems
                 st = self.executor.submit(s.motion.step, step=step)
-                stepthreads.append(st)
+                stepthreads.append((st, s.motion))
 
-            for st in stepthreads:
+            for st, motion in stepthreads:
                 if softexit.triggered:
                     return
                 st.result()
+                if motion.finished:
+                    self.finished = True
+                    self.exit_status = motion.exit_status or "success"
+                    self.exit_message = motion.exit_message
+
+            if self.finished:
+                return
         else:
             for s in self.syslist:
                 s.motion.step(step=step)
                 if softexit.triggered:
+                    return
+                if s.motion.finished:
+                    self.finished = True
+                    self.exit_status = s.motion.exit_status or "success"
+                    self.exit_message = s.motion.exit_message
                     return
 
         # does the "super motion" step
         if self.smotion is not None:
             self.smotion.step(step)
 
-        # After all systems have taken a step and before outputs are written,
-        # give each forcefield a chance to perform end-of-step updates
-        # (e.g. FFCPVasp.refreshing Fermi level and workfunction from extras).
-        for k, f in self.fflist.items():
-            try:
-                f.update()
-            except Exception:
-                # Forcefield-specific update failures should not crash the MD loop.
-                # Detailed warnings are emitted inside the forcefield where possible.
+        self._update_constant_potential_forcefields()
+
+    def _initialize_constant_potential_observables(self):
+        """Compute one real step-zero force result before any electronic kick."""
+
+        for index, system in enumerate(self.syslist):
+            motion = system.motion
+            if getattr(motion, "electronic_state", None) is None:
                 continue
+            motion._sync_electronic_charge(taint=False)
+            # Synchronize normal modes before reading extras. This lets the same
+            # force result serve initial output and the first atomic/electronic B step.
+            _ = system.ensemble.econs
+            fermi = motion._get_fermi_level_from_forces()
+            motion._cache_fermi_level(f"step0:{index}", fermi)
+
+    def _update_constant_potential_forcefields(self):
+        """Run strict post-processing only for active electronic forcefields."""
+
+        for forcefield in self.fflist.values():
+            if getattr(forcefield, "charge_enabled", False):
+                forcefield.update()
 
     def stop(self):
         for k, f in self.fflist.items():
             f.stop()
-
-    def _update_initial_fermi_levels(self):
-        """Update Fermi levels for all systems before initial output.
-
-        This method triggers a force calculation for each system to obtain
-        the initial Fermi level, making it available for step 0 output.
-        """
-        from ipi.utils.messages import info, verbosity
-
-        for i, system in enumerate(self.syslist):
-            # Check if this system has electronic degrees of freedom
-            if (hasattr(system.motion, 'electrons_config') and
-                system.motion.electrons_config is not None and
-                hasattr(system.motion, 'electronic_state') and
-                system.motion.electronic_state is not None):
-
-                try:
-                    # Try to get Fermi level from forces.extras without triggering new calculation
-                    # If forces were already calculated, extras should be available
-                    fermi_level = system.motion._get_fermi_level_from_forces()
-
-                    # Ensure fermi_level is scalar (already handled in _get_fermi_level_from_forces)
-
-                    # Update electronic state for output
-                    # CRITICAL: current_ef must be in atomic units (Hartree), but fermi_level is in eV
-                    # Convert eV to Hartree for i-PI's property output system
-                    fermi_level_au = fermi_level / Constants.EV_PER_HARTREE  # eV to Hartree conversion
-                    system.motion.electronic_state.current_ef = fermi_level_au
-
-                    info(f" @STEP0_OPTIMIZATION: System {i}: Updated initial Fermi level to {fermi_level:.6f} eV (= {fermi_level_au:.6f} au)", verbosity.medium)
-
-                except Exception as e:
-                    from ipi.utils.messages import warning
-                    warning(f"Failed to update initial Fermi level for system {i}: {e}. Using 0.0.", verbosity.medium)
-                    system.motion.electronic_state.current_ef = 0.0
 
 
 dproperties(Simulation, ["step"])

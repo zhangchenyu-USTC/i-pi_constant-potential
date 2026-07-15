@@ -17,14 +17,14 @@ import time
 import threading
 
 import numpy as np
-import json
+
+from multiprocessing import shared_memory
 
 from ipi.utils.messages import verbosity, warning, info
 from ipi.utils.softexit import softexit
-from ipi.utils.units import Constants
+from ipi.interfaces.utils import parse_extra
 
 from concurrent.futures import ThreadPoolExecutor
-
 
 __all__ = ["InterfaceSocket"]
 
@@ -232,6 +232,7 @@ class Driver(DriverSocket):
         self.lastreq = None
         self.locked = False
         self.exit_on_disconnect = False
+        self.batch_size = 1  # >1 enables batched POSDATA/GETFORCE for this client
 
     def shutdown(self, how=socket.SHUT_RDWR):
         """Tries to send an exit message to clients to let them exit gracefully."""
@@ -369,6 +370,12 @@ class Driver(DriverSocket):
 
         if self.status & Status.NeedsInit:
             try:
+                if self.batch_size > 1:
+                    # announce batching to the driver via the INIT string; a
+                    # batch-aware driver switches to the batched protocol
+                    # it checks if there are several parameters just in case
+                    sep = "," if pars.strip() else ""
+                    pars = pars + "%s batch_size:%d" % (sep, self.batch_size)
                 # combines all messages in one to reduce latency
                 self.sendall(
                     MESSAGE["init"]
@@ -421,72 +428,55 @@ class Driver(DriverSocket):
         else:
             raise InvalidStatus("Status in sendpos was " + self.status)
 
-    def sendchg(self, nelect, solvation_flag=1):
-        """Sends updated electronic charge (NELECT) and solvation flag to the driver.
-
-        Uses the CHGDATA header followed by:
-            - float64: nelect
-            - int32: solvation_flag
-
-        This is a lightweight message that does not change the driver's status
-        flags; it is intended to be sent while the client is Ready, before
-        sending POSDATA for the next force evaluation.
-        """
+    def sendchg(self, nelect, mode_flags):
+        """Send the constant-potential CHGDATA payload while the driver is ready."""
 
         if not (self.status & Status.Ready):
             raise InvalidStatus("Status in sendchg was " + str(self.status))
+        nelect = float(nelect)
+        mode_flags = int(mode_flags)
+        if not np.isfinite(nelect) or nelect <= 0.0:
+            raise ValueError("CHGDATA electron number must be finite and positive.")
+        if mode_flags < 0 or mode_flags > 3:
+            raise ValueError("CHGDATA mode_flags must be a bitmask in [0, 3].")
+        self.sendall(
+            MESSAGE["chgdata"]
+            + np.float64(nelect).tobytes()
+            + np.int32(mode_flags).tobytes()
+        )
 
-        try:
-            payload_nelect = np.float64(nelect)
-            payload_solv = np.int32(solvation_flag)
-            self.sendall(
-                MESSAGE["chgdata"] + payload_nelect.tobytes() + payload_solv.tobytes()
-            )
-        except Exception as exc:
-            warning(
-                f" @SOCKET:   Exception during CHGDATA send: {exc}",
-                verbosity.quiet,
-            )
-
-    def getforce(self):
-        """Gets the potential energy, force and virial from the driver.
+    def _recv_forceready(self):
+        """Receives the FORCEREADY header after GETFORCE has been sent.
 
         Raises:
-           InvalidStatus: Raised if the status is not HasData.
            Disconnected: Raised if the driver has disconnected.
-
-        Returns:
-           A list of the form [potential, force, virial, extra].
         """
+        reply = ""
+        while True:
+            try:
+                reply = self.recv_msg()
+            except socket.timeout:
+                warning(" @SOCKET:   Timeout in getforce, trying again!", verbosity.low)
+                continue
+            except:
+                warning(
+                    " @SOCKET:   Error while receiving message: %s" % (reply),
+                    verbosity.low,
+                )
+                raise Disconnected()
+            if reply == MESSAGE["forceready"]:
+                return
+            else:
+                warning(
+                    " @SOCKET:   Unexpected getforce reply: %s" % (reply),
+                    verbosity.low,
+                )
+            if reply == "":
+                raise Disconnected()
 
-        if self.status & Status.HasData:
-            self.send_msg("getforce")
-            reply = ""
-            while True:
-                try:
-                    reply = self.recv_msg()
-                except socket.timeout:
-                    warning(
-                        " @SOCKET:   Timeout in getforce, trying again!", verbosity.low
-                    )
-                    continue
-                except:
-                    warning(
-                        " @SOCKET:   Error while receiving message: %s" % (reply),
-                        verbosity.low,
-                    )
-                    raise Disconnected()
-                if reply == MESSAGE["forceready"]:
-                    break
-                else:
-                    warning(
-                        " @SOCKET:   Unexpected getforce reply: %s" % (reply),
-                        verbosity.low,
-                    )
-                if reply == "":
-                    raise Disconnected()
-        else:
-            raise InvalidStatus("Status in getforce was " + str(self.status))
+    def _recv_force_data(self):
+        """Receives the [potential, force, virial, extra] payload that follows
+        the FORCEREADY header."""
 
         mu = np.float64()
         mu = self.recvall(mu)
@@ -511,30 +501,26 @@ class Driver(DriverSocket):
             mxtra = bytearray(mxtra).decode("utf-8")
         else:
             mxtra = ""
-        mxtradict = {}
-        if mxtra:
-            try:
-                mxtradict = json.loads(mxtra)
-                # info(
-                #     "@driver.getforce: Extra string JSON has been loaded.",
-                #     verbosity.debug,
-                # )
-            except:
-                # if we can't parse it as a dict, issue a warning and carry on
-                # info(
-                #     "@driver.getforce: Extra string could not be loaded as a dictionary. Extra="
-                #     + mxtra,
-                #     verbosity.debug,
-                # )
-                mxtradict = {}
-                pass
-            if "raw" in mxtradict:
-                raise ValueError(
-                    "'raw' cannot be used as a field in a JSON-formatted extra string"
-                )
+        return [mu, mf, mvir, parse_extra(mxtra)]
 
-            mxtradict["raw"] = mxtra
-        return [mu, mf, mvir, mxtradict]
+    def getforce(self):
+        """Gets the potential energy, force and virial from the driver.
+
+        Raises:
+           InvalidStatus: Raised if the status is not HasData.
+           Disconnected: Raised if the driver has disconnected.
+
+        Returns:
+           A list of the form [potential, force, virial, extra].
+        """
+
+        if self.status & Status.HasData:
+            self.send_msg("getforce")
+            self._recv_forceready()
+        else:
+            raise InvalidStatus("Status in getforce was " + str(self.status))
+
+        return self._recv_force_data()
 
     def dispatch(self, r):
         """Dispatches a request r and looks after it setting results
@@ -551,11 +537,12 @@ class Driver(DriverSocket):
             return
 
         r["t_dispatched"] = time.time()
-
         self.get_status()
+        just_initialized = False
         if self.status & Status.NeedsInit:
             self.initialize(r["id"], r["pars"])
             self.status = self.get_status()
+            just_initialized = True
 
         if not (self.status & Status.Ready):
             warning(
@@ -564,25 +551,11 @@ class Driver(DriverSocket):
             )
             return
 
-        # If the request carries an updated electronic charge (NELECT), send it
-        # to the driver before sending positions, using the lightweight CHGDATA
-        # message.
-        #
-        # The CHGDATA payload is:
-        #   - float64: nelect
-        #   - int32: solvation_flag
-        #
-        # solvation_flag defaults to 1 (enable every step) unless overridden.
-        nelect = r.get("nelect", None)
-        solvation_flag = r.get("solvation_flag", 1)
-        if nelect is not None:
-            try:
-                self.sendchg(nelect, int(solvation_flag))
-            except Exception as exc:
-                warning(
-                    f" @SOCKET:   Failed to send CHGDATA for request {r['id']}: {exc}",
-                    verbosity.low,
-                )
+        if "nelect" in r:
+            # A newly connected or restarted driver cannot own a solvent cache.
+            # Force bit 0 on its first CHGDATA irrespective of the restored MD step.
+            mode_flags = int(r["mode_flags"]) | (1 if just_initialized else 0)
+            self.sendchg(r["nelect"], mode_flags)
 
         r["start"] = time.time()
         self.sendpos(r["pos"][r["active"]], r["cell"])
@@ -612,13 +585,636 @@ class Driver(DriverSocket):
             r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
             r["result"][1][r["active"]] = rftemp
         r["t_finished"] = time.time()
-        self.lastreq = r["id"]  #
+        self.lastreq = r["id"]
 
         # updates the status of the client before leaving
         self.get_status()
 
         # marks the request as done as the very last thing
         r["status"] = "Done"
+        r._event_done.set()
+
+    def dispatch_send(self, r):
+        """Sends POSDATA + cell + atoms + GETFORCE in a single sendall and
+        returns without waiting for the force payload, which is collected
+        later by `dispatch_recv` once the client socket becomes readable.
+
+        Returns True on success, False if the client is in an unexpected
+        state or the send failed; on failure the client is marked
+        Disconnected so the next pool_update can prune it.
+        """
+        global TIMEOUT
+
+        if not (self.status & Status.Up):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send! (I)",
+                verbosity.low,
+            )
+            return False
+
+        r["t_dispatched"] = time.time()
+
+        if not (self.status & Status.Ready):
+            self.get_status()
+        just_initialized = False
+        if self.status & Status.NeedsInit:
+            self.initialize(r["id"], r["pars"])
+            self.status = self.get_status()
+            just_initialized = True
+
+        if not (self.status & Status.Ready):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send! (II)",
+                verbosity.low,
+            )
+            return False
+
+        r["start"] = time.time()
+        pos = r["pos"][r["active"]]
+        h_ih = r["cell"]
+        try:
+            charge_payload = b""
+            if "nelect" in r:
+                nelect = float(r["nelect"])
+                mode_flags = int(r["mode_flags"]) | (1 if just_initialized else 0)
+                if not np.isfinite(nelect) or nelect <= 0.0:
+                    raise ValueError(
+                        "CHGDATA electron number must be finite and positive."
+                    )
+                if mode_flags < 0 or mode_flags > 3:
+                    raise ValueError("CHGDATA mode_flags must be in [0, 3].")
+                charge_payload = (
+                    MESSAGE["chgdata"]
+                    + np.float64(nelect).tobytes()
+                    + np.int32(mode_flags).tobytes()
+                )
+            self.sendall(
+                charge_payload
+                + MESSAGE["posdata"]
+                + h_ih[0].tobytes()
+                + h_ih[1].tobytes()
+                + np.int32(len(pos) // 3).tobytes()
+                + pos.tobytes()
+                + MESSAGE["getforce"]
+            )
+        except socket.timeout:
+            warning(
+                f"Timeout in sendall after {TIMEOUT}s: resetting status and increasing timeout",
+                verbosity.quiet,
+            )
+            self.status = Status.Timeout
+            TIMEOUT *= 2
+            return False
+        except Exception as e:
+            warning(
+                " @SOCKET:   Error during dispatch_send: %s" % str(e),
+                verbosity.low,
+            )
+            self.status = Status.Disconnected
+            return False
+
+        self.status = Status.Up | Status.HasData
+        return True
+
+    def dispatch_recv(self, r):
+        """Reads FORCEREADY and the force payload for a request previously
+        handed to `dispatch_send`. The caller must have determined that the
+        socket is readable.
+
+        Returns True on success, False if the client disconnected
+        mid-transfer; in that case the client is marked Disconnected and the
+        request is left untouched so the caller can re-queue it.
+        """
+
+        natoms = len(r["pos"][r["active"]]) // 3
+        try:
+            r["result"] = self._recv_forces_bulk(natoms)
+        except Disconnected:
+            self.status = Status.Disconnected
+            return False
+
+        r["result"][0] -= r["offset"]
+
+        # If only a piece of the system is active, resize forces and reassign
+        if len(r["active"]) != len(r["pos"]):
+            rftemp = r["result"][1]
+            r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
+            r["result"][1][r["active"]] = rftemp
+        r["t_finished"] = time.time()
+        self.lastreq = r["id"]
+
+        # Probe the real post-force status: most clients go back to Ready,
+        # but some (e.g. ASE-backed) transition to NeedsInit each step.
+        self.get_status()
+
+        r["status"] = "Done"
+        r._event_done.set()
+        return True
+
+    def _recv_forces_bulk(self, natoms):
+        """Reads FORCEREADY and the full force payload for a known atom
+        count, returning [mu, mf, mvir, mxtradict].
+
+        Wire layout right after GETFORCE:
+            FORCEREADY header           HDRLEN B
+            potential (float64)         8 B
+            atom count (int32)          4 B
+            forces (3*natoms float64)   24*natoms B
+            virial (3x3 float64)        72 B
+            extra-string length (int32) 4 B
+            extra string                variable
+
+        The fixed-size prefix is read in one go into the per-Driver scratch
+        buffer; the variable-length extra string, when present, is fetched
+        in a follow-up read.
+        """
+
+        full_size = HDRLEN + 8 + 4 + 24 * natoms + 72 + 4
+        if full_size > len(self._buf):
+            self._buf = np.zeros(full_size, np.byte)
+
+        view = memoryview(self._buf)
+        bpos = 0
+        ntimeout = 0
+        while bpos < full_size:
+            try:
+                bpart = self.recv_into(view[bpos:full_size], full_size - bpos)
+            except socket.timeout:
+                ntimeout += 1
+                if ntimeout > NTIMEOUT:
+                    warning(
+                        " @SOCKET:  Couldn't receive within %5d attempts. Time to give up!"
+                        % (NTIMEOUT),
+                        verbosity.low,
+                    )
+                    raise Disconnected()
+                continue
+            if bpart == 0:
+                raise Disconnected()
+            bpos += bpart
+
+        buf = self._buf
+        if bytes(buf[:HDRLEN]) != MESSAGE["forceready"]:
+            warning(
+                " @SOCKET:   Unexpected getforce reply: %s" % bytes(buf[:HDRLEN]),
+                verbosity.low,
+            )
+            raise Disconnected()
+
+        off = HDRLEN
+        mu = float(np.frombuffer(buf, dtype=np.float64, count=1, offset=off)[0])
+        off += 8
+        mlen = int(np.frombuffer(buf, dtype=np.int32, count=1, offset=off)[0])
+        off += 4
+        if mlen != natoms:
+            raise InvalidSize
+        # Copy out of the scratch buffer so the result outlives the next dispatch.
+        mf = np.frombuffer(buf, dtype=np.float64, count=3 * natoms, offset=off).copy()
+        off += 24 * natoms
+        mvir = (
+            np.frombuffer(buf, dtype=np.float64, count=9, offset=off)
+            .reshape(3, 3)
+            .copy()
+        )
+        off += 72
+        extra_len = int(np.frombuffer(buf, dtype=np.int32, count=1, offset=off)[0])
+
+        if extra_len > 0:
+            if extra_len > len(self._buf):
+                self._buf = np.zeros(extra_len, np.byte)
+            view = memoryview(self._buf)
+            bpos = 0
+            ntimeout = 0
+            while bpos < extra_len:
+                try:
+                    bpart = self.recv_into(view[bpos:extra_len], extra_len - bpos)
+                except socket.timeout:
+                    ntimeout += 1
+                    if ntimeout > NTIMEOUT:
+                        raise Disconnected()
+                    continue
+                if bpart == 0:
+                    raise Disconnected()
+                bpos += bpart
+            mxtra = bytes(self._buf[:extra_len]).decode("utf-8")
+        else:
+            mxtra = ""
+
+        return [mu, mf, mvir, parse_extra(mxtra)]
+
+    def dispatch_send_batch(self, reqs):
+        """Sends a list of requests as one batched POSDATA + GETFORCE.
+
+        The batch is padded to ``batch_size`` by replicating the last request,
+        so the driver always receives a fixed number of structures (its buffers
+        are sized once, from the batch level announced at INIT). Only a single
+        atom count travels on the wire; all structures share it.
+        """
+        if len(reqs) == 0:
+            raise ValueError("dispatch_send_batch called with an empty request list")
+
+        global TIMEOUT
+
+        if not (self.status & Status.Up):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send_batch! (I)",
+                verbosity.low,
+            )
+            return False
+
+        now = time.time()
+        for r in reqs:
+            r["t_dispatched"] = now
+
+        if not (self.status & Status.Ready):
+            self.get_status()
+        if self.status & Status.NeedsInit:
+            self.initialize(reqs[0]["id"], reqs[0]["pars"])
+            self.status = self.get_status()
+
+        if not (self.status & Status.Ready):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send_batch! (II)",
+                verbosity.low,
+            )
+            return False
+
+        now = time.time()
+        for r in reqs:
+            r["start"] = now
+
+        # pad to a full batch by replicating the last request (results discarded)
+        padded = list(reqs)
+        if len(padded) < self.batch_size:
+            padded += [padded[-1]] * (self.batch_size - len(padded))
+        # Note that the line below assumes all requests have the same number of active atoms; if this is not the case, the driver will likely crash.
+        nat = len(padded[0]["pos"][padded[0]["active"]]) // 3
+        try:
+            payload = MESSAGE["posdata"] + np.int32(nat).tobytes()
+            for r in padded:  # cells block: h, ih per structure
+                payload += r["cell"][0].tobytes() + r["cell"][1].tobytes()
+            for r in padded:  # positions block: (batch_size, 3*nat)
+                payload += r["pos"][r["active"]].tobytes()
+            payload += MESSAGE["getforce"]
+            self.sendall(payload)
+        except socket.timeout:
+            warning(
+                f"Timeout in sendall after {TIMEOUT}s: resetting status and increasing timeout",
+                verbosity.quiet,
+            )
+            self.status = Status.Timeout
+            TIMEOUT *= 2
+            return False
+        except Exception as e:
+            warning(
+                " @SOCKET:   Error during dispatch_send_batch: %s" % str(e),
+                verbosity.low,
+            )
+            self.status = Status.Disconnected
+            return False
+
+        self.status = Status.Up | Status.HasData
+        return True
+
+    def dispatch_recv_batch(self, reqs):
+        """Collects a batched FORCEREADY payload and fans the results out to the
+        ``len(reqs)`` real requests (padded results are dropped)."""
+
+        natoms = len(reqs[0]["pos"][reqs[0]["active"]]) // 3
+        try:
+            results = self._recv_forces_bulk_batch(natoms, len(reqs))
+        except Disconnected:
+            self.status = Status.Disconnected
+            return False
+
+        for r, res in zip(reqs, results):
+            res[0] -= r["offset"]
+            # if only a piece of the system is active, resize forces and reassign
+            if len(r["active"]) != len(r["pos"]):
+                rftemp = res[1]
+                res[1] = np.zeros(len(r["pos"]), dtype=np.float64)
+                res[1][r["active"]] = rftemp
+            r["result"] = res
+            r["t_finished"] = time.time()
+            r["status"] = "Done"
+            r._event_done.set()
+        self.lastreq = reqs[-1]["id"]
+
+        # probe the post-force status, as for the single-request path
+        self.get_status()
+        return True
+
+    def _recv_forces_bulk_batch(self, natoms, n_real):
+        """Reads FORCEREADY + a fixed batch of ``batch_size`` results, returning
+        the first ``n_real`` as [mu, mf, mvir, mxtradict] lists.
+
+        Wire layout right after GETFORCE:
+            FORCEREADY header           HDRLEN B
+            potentials (batch float64)  8*batch B
+            atom count (int32)          4 B
+            forces (batch*3*nat f64)    24*nat*batch B
+            virials (batch*3*3 f64)     72*batch B
+            per-structure extra:        batch * (int32 len + len B)
+        """
+
+        nbatch = self.batch_size
+        hdr = bytes(self.recvall(np.zeros(HDRLEN, np.dtype("S1"))))
+        if hdr != MESSAGE["forceready"]:
+            warning(
+                " @SOCKET:   Unexpected getforce reply: %s" % hdr,
+                verbosity.low,
+            )
+            raise Disconnected()
+
+        pots = self.recvall(np.zeros(nbatch, np.float64))
+        mlen = int(self.recvall(np.int32()))
+        if mlen != natoms:
+            raise InvalidSize
+        forces = self.recvall(np.zeros((nbatch, 3 * natoms), np.float64))
+        virs = self.recvall(np.zeros((nbatch, 3, 3), np.float64))
+
+        results = []
+        for i in range(nbatch):
+            # extras for every structure must be drained, even padded ones
+            elen = int(self.recvall(np.int32()))
+            if elen > 0:
+                mxtra = bytearray(self.recvall(np.zeros(elen, np.dtype("S1")))).decode(
+                    "utf-8"
+                )
+            else:
+                mxtra = ""
+            if i < n_real:
+                results.append(
+                    [
+                        float(pots[i]),
+                        forces[i].copy(),
+                        virs[i].copy(),
+                        parse_extra(mxtra),
+                    ]
+                )
+        return results
+
+
+class SHMDriver(Driver):
+    """Driver that exchanges the bulk numeric payload through shared memory.
+
+    The unix socket carries only the control handshake (which also serializes
+    the producer/consumer timing, so no extra locks are needed) and the
+    variable-length 'extra' strings. Positions, cell, potential, force and
+    virial travel through per-client shared-memory segments owned by this
+    process, sized once for a full batch of ``batch_size`` structures
+    (batch_size == 1 for the non-batched paths). The same segments and trigger
+    serve both the single-request and the batched dispatch.
+    """
+
+    _SHM_KINDS = ("pos", "h", "ih", "pot", "force", "vir")
+
+    def __init__(self, sock):
+        super(SHMDriver, self).__init__(sock)
+        self._shm_allocated = False
+        self._first_posdata = True
+        self._shm = {}  # kind -> SharedMemory handle (owned)
+        self._view = {}  # kind -> numpy view, shape (batch_size, ...)
+        self._shm_prefix = f"ipi_shm_{os.getpid()}_{sock.fileno()}_"
+
+    # -- segment lifecycle ---------------------------------------------------
+    def _create_segment(self, kind, nbytes):
+        name = self._shm_prefix + kind
+        try:
+            shm = shared_memory.SharedMemory(create=True, size=nbytes, name=name)
+        except FileExistsError:
+            # leftover from a crashed run with the same pid/fileno: reclaim it
+            shared_memory.SharedMemory(name=name).unlink()
+            shm = shared_memory.SharedMemory(create=True, size=nbytes, name=name)
+        # this process owns the segment; close()+unlink() in _free_shm also
+        # deregisters it from the resource_tracker, so don't unregister here.
+        self._shm[kind] = shm
+        return shm
+
+    def _alloc_shm(self, natoms):
+        n = self.batch_size
+        itemsize = np.dtype(np.float64).itemsize
+        shapes = {
+            "pos": (n, 3 * natoms),
+            "h": (n, 3, 3),
+            "ih": (n, 3, 3),
+            "pot": (n,),
+            "force": (n, 3 * natoms),
+            "vir": (n, 3, 3),
+        }
+        for kind in self._SHM_KINDS:
+            shape = shapes[kind]
+            nbytes = int(np.prod(shape)) * itemsize
+            shm = self._create_segment(kind, nbytes)
+            self._view[kind] = np.ndarray(shape, dtype=np.float64, buffer=shm.buf)
+        self._shm_allocated = True
+
+    def _free_shm(self):
+        for shm in self._shm.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+        self._shm.clear()
+        self._view.clear()
+
+    # -- shared fill / read --------------------------------------------------
+    def _fill_shm(self, structs):
+        """Stages a list of (pos, (h, ih)) structures into the shared segments
+        (slots 0..len-1) and returns the POSDATA trigger: header + atom count +
+        (first exchange only) the names of the segments the driver attaches to."""
+        natoms = len(structs[0][0]) // 3
+        if not self._shm_allocated:
+            self._alloc_shm(natoms)
+        for i, (pos, h_ih) in enumerate(structs):
+            self._view["pos"][i] = pos
+            self._view["h"][i] = h_ih[0]
+            self._view["ih"][i] = h_ih[1]
+
+        payload = MESSAGE["posdata"] + np.int32(natoms).tobytes()
+        if self._first_posdata:
+            for kind in self._SHM_KINDS:
+                name = self._shm[kind].name.encode("utf-8")
+                payload += np.int32(len(name)).tobytes() + name
+            self._first_posdata = False
+        return payload
+
+    def _read_shm_results(self, count):
+        """Copies the first ``count`` results (pot/force/vir) out of the shared
+        segments; the 'extra' strings are read separately from the socket."""
+        return [
+            [
+                float(self._view["pot"][i]),
+                self._view["force"][i].copy(),
+                self._view["vir"][i].copy(),
+            ]
+            for i in range(count)
+        ]
+
+    def _recv_extra(self):
+        """Reads one length-prefixed extra string off the socket."""
+        elen = int(self.recvall(np.int32()))
+        if elen > 0:
+            return bytearray(self.recvall(np.zeros(elen, np.dtype("S1")))).decode(
+                "utf-8"
+            )
+        return ""
+
+    # -- single-request path -------------------------------------------------
+    def sendpos(self, pos, h_ih):
+        global TIMEOUT
+        if not (self.status & Status.Ready):
+            raise InvalidStatus("Status in sendpos was " + self.status)
+        try:
+            self.sendall(self._fill_shm([(pos, h_ih)]))
+            self.status = Status.Up | Status.Busy
+        except socket.timeout:
+            warning(
+                f"Timeout in sendall after {TIMEOUT}s: resetting status and increasing timeout",
+                verbosity.quiet,
+            )
+            self.status = Status.Timeout
+            TIMEOUT *= 2
+            return
+        except Exception as exc:
+            warning(f"Other exception during posdata send: {exc}", verbosity.quiet)
+            raise exc
+
+    def dispatch_send(self, r):
+        global TIMEOUT
+        if not (self.status & Status.Up):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send! (I)",
+                verbosity.low,
+            )
+            return False
+        r["t_dispatched"] = time.time()
+        if not (self.status & Status.Ready):
+            self.get_status()
+        if self.status & Status.NeedsInit:
+            self.initialize(r["id"], r["pars"])
+            self.status = self.get_status()
+        if not (self.status & Status.Ready):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send! (II)",
+                verbosity.low,
+            )
+            return False
+        r["start"] = time.time()
+        try:
+            self.sendall(
+                self._fill_shm([(r["pos"][r["active"]], r["cell"])])
+                + MESSAGE["getforce"]
+            )
+        except socket.timeout:
+            warning(
+                f"Timeout in sendall after {TIMEOUT}s: resetting status and increasing timeout",
+                verbosity.quiet,
+            )
+            self.status = Status.Timeout
+            TIMEOUT *= 2
+            return False
+        except Exception as e:
+            warning(
+                " @SOCKET:   Error during dispatch_send: %s" % str(e), verbosity.low
+            )
+            self.status = Status.Disconnected
+            return False
+        self.status = Status.Up | Status.HasData
+        return True
+
+    def _recv_force_data(self):
+        # threaded path: getforce() has already consumed FORCEREADY, so only the
+        # extra string remains on the socket; pot/force/vir come from SHM.
+        mu, mf, mvir = self._read_shm_results(1)[0]
+        return [mu, mf, mvir, parse_extra(self._recv_extra())]
+
+    def _recv_forces_bulk(self, natoms):
+        # consolidated path: read the FORCEREADY ack and the extra here.
+        hdr = bytes(self.recvall(np.zeros(HDRLEN, np.dtype("S1"))))
+        if hdr != MESSAGE["forceready"]:
+            warning(" @SOCKET:   Unexpected getforce reply: %s" % hdr, verbosity.low)
+            raise Disconnected()
+        mu, mf, mvir = self._read_shm_results(1)[0]
+        return [mu, mf, mvir, parse_extra(self._recv_extra())]
+
+    # -- batched path --------------------------------------------------------
+    def dispatch_send_batch(self, reqs):
+        if len(reqs) == 0:
+            raise ValueError("dispatch_send_batch called with an empty request list")
+        global TIMEOUT
+        if not (self.status & Status.Up):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send_batch! (I)",
+                verbosity.low,
+            )
+            return False
+        now = time.time()
+        for r in reqs:
+            r["t_dispatched"] = now
+        if not (self.status & Status.Ready):
+            self.get_status()
+        if self.status & Status.NeedsInit:
+            self.initialize(reqs[0]["id"], reqs[0]["pars"])
+            self.status = self.get_status()
+        if not (self.status & Status.Ready):
+            warning(
+                " @SOCKET:   Inconsistent client state in dispatch_send_batch! (II)",
+                verbosity.low,
+            )
+            return False
+        now = time.time()
+        for r in reqs:
+            r["start"] = now
+        # pad to a full batch by replicating the last request (results discarded)
+        padded = list(reqs)
+        if len(padded) < self.batch_size:
+            padded += [padded[-1]] * (self.batch_size - len(padded))
+        structs = [(r["pos"][r["active"]], r["cell"]) for r in padded]
+        try:
+            self.sendall(self._fill_shm(structs) + MESSAGE["getforce"])
+        except socket.timeout:
+            warning(
+                f"Timeout in sendall after {TIMEOUT}s: resetting status and increasing timeout",
+                verbosity.quiet,
+            )
+            self.status = Status.Timeout
+            TIMEOUT *= 2
+            return False
+        except Exception as e:
+            warning(
+                " @SOCKET:   Error during dispatch_send_batch: %s" % str(e),
+                verbosity.low,
+            )
+            self.status = Status.Disconnected
+            return False
+        self.status = Status.Up | Status.HasData
+        return True
+
+    def _recv_forces_bulk_batch(self, natoms, n_real):
+        hdr = bytes(self.recvall(np.zeros(HDRLEN, np.dtype("S1"))))
+        if hdr != MESSAGE["forceready"]:
+            warning(" @SOCKET:   Unexpected getforce reply: %s" % hdr, verbosity.low)
+            raise Disconnected()
+        results = self._read_shm_results(n_real)
+        out = []
+        for i in range(self.batch_size):
+            # every structure's extra must be drained, even padded ones
+            extra = self._recv_extra()
+            if i < n_real:
+                out.append(results[i] + [parse_extra(extra)])
+        return out
+
+    # -- cleanup -------------------------------------------------------------
+    def shutdown(self, how=socket.SHUT_RDWR):
+        try:
+            super(SHMDriver, self).shutdown(how)
+        finally:
+            self._free_shm()
+
+    def __del__(self):
+        self._free_shm()
 
 
 class InterfaceSocket(object):
@@ -663,6 +1259,8 @@ class InterfaceSocket(object):
         exit_on_disconnect=False,
         max_workers=128,
         sockets_prefix="/tmp/ipi_",
+        consolidate_messages=True,
+        batch_size=1,
     ):
         """Initialises interface.
 
@@ -675,7 +1273,13 @@ class InterfaceSocket(object):
            mode: An optional string giving the type of socket. Defaults to 'unix'.
            timeout: Length of time waiting for data from a client before we assume
               the connection is dead and disconnect the client.
-            max_workers: Maximum number of threads launched concurrently
+           max_workers: Maximum number of threads launched concurrently
+              (only used when `consolidate_messages` is False).
+           consolidate_messages: If True, fuse the STATUS/POSDATA/GETFORCE
+              exchange into a single send and multiplex the FORCEREADY
+              responses on the poll thread via select(). Saves several
+              round-trips per dispatch and removes worker-thread GIL
+              contention, but assumes clients follow the protocol strictly.
 
         Raises:
            NameError: Raised if mode is not 'unix' or 'inet'.
@@ -693,6 +1297,9 @@ class InterfaceSocket(object):
         self.requests = None  # these will be linked to the request list of the FFSocket object using the interface
         self.exit_on_disconnect = exit_on_disconnect
         self.max_workers = max_workers
+        self.consolidate_messages = consolidate_messages
+        # number of queued structures sent to one client per batched exchange
+        self.batch_size = batch_size
         self.offset = 0.0  # a constant energy offset added to the results returned by the driver (hacky but simple)
 
     def open(self):
@@ -702,7 +1309,9 @@ class InterfaceSocket(object):
         create the associated socket object.
         """
 
-        if self.mode == "unix":
+        # "shm" uses a unix socket for the control handshake; only the bulk
+        # numeric payload is moved into shared memory by SHMDriver.
+        if self.mode in ("unix", "shm"):
             self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 self.server.bind(self.sockets_prefix + self.address)
@@ -741,7 +1350,7 @@ class InterfaceSocket(object):
             raise NameError(
                 "InterfaceSocket mode "
                 + self.mode
-                + " is not implemented (should be unix/inet)"
+                + " is not implemented (should be unix/inet/shm)"
             )
 
         self.server.listen(self.slots)
@@ -779,8 +1388,12 @@ class InterfaceSocket(object):
                 " @interfacesocket.close: Problem shutting down the server socket. Will just continue and hope for the best.",
                 verbosity.low,
             )
-        if self.mode == "unix":
-            os.unlink(self.sockets_prefix + self.address)
+        if self.mode in ("unix", "shm"):
+            # both modes bind a unix-domain socket file that must be removed
+            try:
+                os.unlink(self.sockets_prefix + self.address)
+            except OSError:
+                pass
 
     def poll(self):
         """Called in the main thread loop.
@@ -851,7 +1464,8 @@ class InterfaceSocket(object):
             if self.server in readable:
                 client, address = self.server.accept()
                 client.settimeout(TIMEOUT)
-                driver = Driver(client)
+                driver = SHMDriver(client) if self.mode == "shm" else Driver(client)
+                driver.batch_size = self.batch_size
                 info(
                     " @interfacesocket.pool_update:   Client asked for connection from "
                     + str(address)
@@ -888,13 +1502,23 @@ class InterfaceSocket(object):
         clients.
         """
 
+        # nothing to do if there are no pending requests and no running jobs
+        if len(self.requests) == 0 and len(self.jobs) == 0:
+            return
+
+        # In consolidated-messaging mode the poll thread itself drives both
+        # send and receive via select(), so the legacy thread-pool path below
+        # is bypassed entirely.
+        if self.consolidate_messages:
+            self._pool_distribute_select()
+            return
+
         ttotal = tdispatch = tcheck = 0
         ttotal -= time.time()
 
         # get clients that are still free
-        freec = self.clients[:]
-        for [r2, c, ct] in self.jobs:
-            freec.remove(c)
+        busy = {id(c) for _, c, _ in self.jobs}
+        freec = [c for c in self.clients if id(c) not in busy]
 
         # fills up list of pending requests if empty, or if clients are abundant
         if len(self.prlist) == 0 or len(freec) > len(self.prlist):
@@ -941,14 +1565,20 @@ class InterfaceSocket(object):
         # check for finished jobs
         nchecked = 0
         nfinished = 0
+        finished_ids = []
         tcheck -= time.time()
-        for [r, c, ct] in self.jobs[:]:
+        for ijob, [r, c, ct] in enumerate(self.jobs):
             chk = self.check_job_finished(r, c, ct)
             if chk == 1:
                 nfinished += 1
+                finished_ids.append(ijob)
             elif chk == 0:
                 self.poll_iter = UPDATEFREQ  # client disconnected. force a pool_update
+                finished_ids.append(ijob)
             nchecked += 1
+        # batch removal of finished/disconnected jobs (reverse order to preserve indices)
+        for ijob in reversed(finished_ids):
+            del self.jobs[ijob]
         tcheck += time.time()
 
         ttotal += time.time()
@@ -957,6 +1587,135 @@ class InterfaceSocket(object):
         if nfinished > 0:
             # don't wait, just try again to distribute
             self.pool_distribute()
+
+    def _pool_distribute_select(self):
+        """Drives both dispatch and collection from the poll thread.
+
+        Each free client is given a request via `dispatch_send` (POSDATA +
+        GETFORCE in a single send), then `select()` multiplexes the
+        FORCEREADY+payload receives as the clients finish computing. Doing
+        all socket I/O on a single thread avoids the GIL contention that
+        otherwise serialises a worker-pool dispatch.
+
+        On client disconnect or timeout the request is put back on the queue
+        and the dead client is flagged so the next `pool_update` prunes it.
+        """
+
+        # Dispatch phase: hand each free client a queued request
+        busy = {id(c) for _, c, _ in self.jobs}
+        freec = [c for c in self.clients if id(c) not in busy]
+
+        if len(self.prlist) == 0 or len(freec) > len(self.prlist):
+            self.prlist = [r for r in self.requests if r["status"] == "Queued"]
+
+        if self.match_mode == "auto":
+            match_seq = ["match", "none", "free", "any"]
+        elif self.match_mode == "any":
+            match_seq = ["any"]
+        elif self.match_mode == "lock":
+            match_seq = ["match", "none"]
+
+        while len(freec) > 0 and len(self.prlist) > 0:
+            dispatched_this_round = False
+            for match_ids in match_seq:
+                for fc in freec[:]:
+                    if self.dispatch_free_client(fc, match_ids):
+                        freec.remove(fc)
+                        dispatched_this_round = True
+                    if len(self.prlist) == 0:
+                        break
+            if self.match_mode == "lock":
+                break
+            if len(freec) > 0:
+                self.prlist = [r for r in self.requests if r["status"] == "Queued"]
+            if not dispatched_this_round:
+                break
+
+        # Flag any dead clients for pool_update.
+        if len(self.jobs) == 0:
+            for c in self.clients:
+                if c.status == Status.Disconnected:
+                    self.poll_iter = UPDATEFREQ
+                    return
+            return
+
+        # Collect phase: drain in-flight jobs as they become readable
+        while self.jobs:
+            sockets = [c for _, c, _ in self.jobs]
+            try:
+                readable, _, _ = select.select(sockets, [], [], 0.01)
+            except (OSError, ValueError) as e:
+                warning(
+                    " @SOCKET: select error in _pool_distribute_select: %s" % str(e),
+                    verbosity.low,
+                )
+                break
+
+            if readable:
+                readable_ids = {id(c) for c in readable}
+                drop_ids = []
+                for ijob, [r, c, _] in enumerate(self.jobs):
+                    if id(c) not in readable_ids:
+                        continue
+                    recv = (
+                        c.dispatch_recv_batch
+                        if isinstance(r, list)
+                        else c.dispatch_recv
+                    )
+                    if recv(r):
+                        drop_ids.append(ijob)
+                    else:
+                        # Client died mid-receive: re-queue the request and
+                        # let pool_update remove the client.
+                        self._requeue_disconnected(r, c)
+                        drop_ids.append(ijob)
+                for ijob in reversed(drop_ids):
+                    del self.jobs[ijob]
+
+            # Drop jobs whose client has gone past the timeout. The request
+            # is re-queued so it will be picked up by another client.
+            if self.timeout > 0 and self.jobs:
+                now = time.time()
+                drop_ids = []
+                for ijob, [r, c, _] in enumerate(self.jobs):
+                    start = (r[0] if isinstance(r, list) else r)["start"]
+                    if start > 0 and now - start > self.timeout:
+                        warning(
+                            " @SOCKET:  Timeout! request has been running for "
+                            + str(now - start)
+                            + " sec.",
+                            verbosity.low,
+                        )
+                        warning(
+                            " @SOCKET:   Client "
+                            + str(c.peername)
+                            + " died or got unresponsive(A). Disconnecting.",
+                            verbosity.low,
+                        )
+                        try:
+                            c.shutdown(socket.SHUT_RDWR)
+                        except socket.error:
+                            pass
+                        c.close()
+                        c.status = Status.Disconnected
+                        self._requeue_disconnected(r, c)
+                        drop_ids.append(ijob)
+                for ijob in reversed(drop_ids):
+                    del self.jobs[ijob]
+
+    def _requeue_disconnected(self, r, c):
+        """Puts a request back on the queue after its assigned client died.
+
+        Resets the request bookkeeping so the next dispatch pass treats it
+        as fresh, and forces an early pool_update so the dead client is
+        pruned from the client list promptly. ``r`` may be a single request or
+        a list of requests (batched job).
+        """
+        for rr in r if isinstance(r, list) else [r]:
+            rr["status"] = "Queued"
+            rr["start"] = -1
+        c.status = Status.Disconnected
+        self.poll_iter = UPDATEFREQ
 
     def dispatch_free_client(self, fc, match_ids="any", send_threads=[]):
         """
@@ -978,6 +1737,10 @@ class InterfaceSocket(object):
                 verbosity.low,
             )
             return False
+
+        if self.batch_size > 1:
+            # batched mode ignores reqid matching: take the next queued chunk
+            return self._dispatch_free_client_batch(fc)
 
         for r in self.prlist[:]:
             if match_ids == "match" and fc.lastreq is not r["id"]:
@@ -1005,29 +1768,58 @@ class InterfaceSocket(object):
 
             r["status"] = "Running"
             self.prlist.remove(r)
-            info(
-                " @interfacesocket.dispatch_free_client: %s Assigning [%5s] request id %4s to client with last-id %4s (% 3d/% 3d : %s)"
-                % (
-                    time.strftime("%y/%m/%d-%H:%M:%S"),
-                    match_ids,
-                    str(r["id"]),
-                    str(fc.lastreq),
-                    self.clients.index(fc),
-                    len(self.clients),
-                    str(fc.peername),
-                ),
-                verbosity.high,
-            )
-            # fc_thread = threading.Thread(
-            #    target=fc.dispatch, name="DISPATCH", kwargs={"r": r}
-            # )
-            fc_thread = self.executor.submit(fc.dispatch, r=r)
-            self.jobs.append([r, fc, fc_thread])
-            # fc_thread.daemon = True
-            # fc_thread.start()
+            if verbosity.high:
+                info(
+                    " @interfacesocket.dispatch_free_client: %s Assigning [%5s] request id %4s to client with last-id %4s (% 3d/% 3d : %s)"
+                    % (
+                        time.strftime("%y/%m/%d-%H:%M:%S"),
+                        match_ids,
+                        str(r["id"]),
+                        str(fc.lastreq),
+                        self.clients.index(fc),
+                        len(self.clients),
+                        str(fc.peername),
+                    ),
+                    verbosity.high,
+                )
+            if self.consolidate_messages:
+                if not fc.dispatch_send(r):
+                    self._requeue_disconnected(r, fc)
+                    return False
+                self.jobs.append([r, fc, None])
+            else:
+                fc_thread = self.executor.submit(fc.dispatch, r=r)
+                self.jobs.append([r, fc, fc_thread])
             return True
 
         return False
+
+    def _dispatch_free_client_batch(self, fc):
+        """Assigns up to batch_size queued requests (any-order, no reqid
+        matching) to a free client as a single batched job."""
+
+        if len(self.prlist) == 0:
+            return False
+
+        reqs = self.prlist[: self.batch_size]
+        for r in reqs:
+            r["offset"] = self.offset
+            r["status"] = "Running"
+            self.prlist.remove(r)
+        fc.locked = False
+
+        if verbosity.high:
+            info(
+                " @interfacesocket.dispatch_free_client: %s Assigning batch of %d request(s) to client %s"
+                % (time.strftime("%y/%m/%d-%H:%M:%S"), len(reqs), str(fc.peername)),
+                verbosity.high,
+            )
+
+        if not fc.dispatch_send_batch(reqs):
+            self._requeue_disconnected(reqs, fc)
+            return False
+        self.jobs.append([reqs, fc, None])
+        return True
 
     def check_job_finished(self, r, c, ct):
         """
@@ -1036,9 +1828,6 @@ class InterfaceSocket(object):
 
         if r["status"] == "Done":
             ct.result()
-            self.jobs = [
-                w for w in self.jobs if not (w[0] is r and w[1] is c)
-            ]  # removes pair in a robust way
             return 1
 
         if (
@@ -1067,378 +1856,3 @@ class InterfaceSocket(object):
             return 0  # client will be cleared and request resuscitated in poll_update
 
         return -1
-
-
-class CP2KSocketServer:
-    """Dedicated CP2K socket server for constant potential simulations.
-
-    This class manages a single TCP server socket for communication with
-    one CP2K process in constant potential molecular dynamics simulations.
-    It implements the i-PI socket protocol with CP2K-specific extensions
-    for Fermi level extraction and charge state management.
-    """
-
-    def __init__(self, host="localhost", port=12345, timeout=30.0):
-        """Initialize CP2K socket server.
-
-        Args:
-            host: Host address for socket binding
-            port: Port number for socket binding
-            timeout: Timeout in seconds for operations
-        """
-        self.host = host
-        self.port = port
-        self.timeout = timeout
-
-        # Server socket for accepting connections
-        self.server_socket = None
-        self.client_socket = None
-        self.is_connected = False
-        self.is_listening = False
-
-        info(f" @CP2KSocketServer: Initialized server for {host}:{port}", verbosity.medium)
-
-    def create_server(self):
-        """Create and bind TCP server socket.
-
-        Returns:
-            bool: True if server created successfully
-        """
-        try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(1)
-            self.is_listening = True
-
-            info(f" @CP2KSocketServer: Created server on {self.host}:{self.port}", verbosity.medium)
-            return True
-
-        except Exception as e:
-            warning(f" @CP2KSocketServer: Failed to create server: {e}", verbosity.medium)
-            self.cleanup()
-            return False
-
-    def accept_connection(self, timeout=None):
-        """Accept connection from CP2K client.
-
-        Args:
-            timeout: Timeout in seconds (None for default)
-
-        Returns:
-            bool: True if connection accepted successfully
-        """
-        if not self.server_socket or not self.is_listening:
-            warning(" @CP2KSocketServer: No server socket available", verbosity.medium)
-            return False
-
-        if self.is_connected and self.client_socket:
-            info(" @CP2KSocketServer: Already connected to client", verbosity.debug)
-            return True
-
-        try:
-            timeout = timeout or self.timeout
-            self.server_socket.settimeout(timeout)
-
-            info(f" @CP2KSocketServer: Waiting for CP2K client connection on port {self.port}", verbosity.medium)
-            self.client_socket, addr = self.server_socket.accept()
-
-            # Disable timeout after connection established
-            self.client_socket.settimeout(None)
-            self.is_connected = True
-
-            info(f" @CP2KSocketServer: Accepted connection from {addr}", verbosity.medium)
-            return True
-
-        except Exception as e:
-            warning(f" @CP2KSocketServer: Failed to accept connection: {e}", verbosity.medium)
-            return False
-
-    def is_connection_healthy(self):
-        """Check if the socket connection is still healthy.
-
-        Returns:
-            bool: True if connection is healthy
-        """
-        try:
-            import select
-
-            if not self.is_connected or not self.client_socket:
-                return False
-
-            # Use select to check if socket is readable (might indicate disconnection)
-            ready, _, _ = select.select([self.client_socket], [], [], 0.001)
-            if ready:
-                try:
-                    data = self.client_socket.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-                    if not data:
-                        # Connection closed by peer
-                        return False
-                except socket.error as e:
-                    if e.errno in (socket.EWOULDBLOCK, socket.EAGAIN):
-                        # No data available, connection is healthy
-                        return True
-                    else:
-                        # Connection error
-                        return False
-
-            return True
-
-        except Exception:
-            return False
-
-    def close_connection(self):
-        """Close client connection."""
-        if self.client_socket:
-            try:
-                self.client_socket.close()
-                info(" @CP2KSocketServer: Closed client connection", verbosity.debug)
-            except Exception as e:
-                warning(f" @CP2KSocketServer: Error closing client: {e}", verbosity.medium)
-            finally:
-                self.client_socket = None
-                self.is_connected = False
-
-    def cleanup(self):
-        """Clean up all socket resources."""
-        self.close_connection()
-
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-                info(" @CP2KSocketServer: Closed server socket", verbosity.debug)
-            except Exception as e:
-                warning(f" @CP2KSocketServer: Error closing server: {e}", verbosity.medium)
-            finally:
-                self.server_socket = None
-                self.is_listening = False
-
-
-class CP2KSocketCommunicator:
-    """CP2K socket communication handler for i-PI protocol.
-
-    This class implements the complete i-PI socket communication protocol
-    specifically for CP2K interactions in constant potential simulations.
-    It handles data serialization, message passing, and error recovery.
-    """
-
-    def __init__(self, socket_server):
-        """Initialize CP2K socket communicator.
-
-        Args:
-            socket_server: CP2KSocketServer instance
-        """
-        self.server = socket_server
-        self.last_error = None
-
-    def send_positions_and_get_forces(self, positions, cell_h, charge=None):
-        """Send positions to CP2K and receive energy, forces, and Fermi level.
-
-        This method implements the complete i-PI communication cycle:
-        STATUS → READY/HAVEDATA → [POSDATA] → GETFORCE → FORCEREADY + data
-
-        Args:
-            positions: Atomic positions array (3*natoms)
-            cell_h: Cell matrix (3x3)
-            charge: Optional charge parameter for endpoint identification
-
-        Returns:
-            dict: Results with keys 'energy', 'forces', 'virial', 'fermi_level', etc.
-                 Returns None on failure.
-        """
-        if not self.server.is_connected or not self.server.client_socket:
-            warning(" @CP2KSocketCommunicator: No active connection", verbosity.medium)
-            return None
-
-        if not self.server.is_connection_healthy():
-            warning(" @CP2KSocketCommunicator: Connection unhealthy, attempting reconnect", verbosity.medium)
-            if not self.server.accept_connection(timeout=30.0):
-                warning(" @CP2KSocketCommunicator: Failed to reconnect", verbosity.medium)
-                return None
-
-        try:
-            return self._execute_ipi_protocol(positions, cell_h, charge)
-
-        except Exception as e:
-            error_msg = str(e).lower()
-            self.last_error = str(e)
-
-            # Smart error classification
-            connection_error_keywords = ['connection', 'socket', 'broken', 'closed', 'reset', 'refused', 'timeout']
-            is_connection_error = any(keyword in error_msg for keyword in connection_error_keywords)
-
-            if is_connection_error:
-                warning(f" @CP2KSocketCommunicator: Connection error, marking for reconnection: {e}", verbosity.medium)
-                self.server.is_connected = False
-                self.server.close_connection()
-            else:
-                # info(f" @CP2KSocketCommunicator: Recoverable error, keeping connection: {e}", verbosity.medium)
-
-            return None
-
-    def _execute_ipi_protocol(self, positions, cell_h, charge):
-        """Execute the complete i-PI socket protocol with CP2K.
-
-        Args:
-            positions: Atomic positions array
-            cell_h: Cell matrix
-            charge: Endpoint charge for logging
-
-        Returns:
-            dict: CP2K calculation results
-        """
-        client_socket = self.server.client_socket
-        natoms = len(positions) // 3
-
-        # Prepare data arrays
-        positions_array = np.array(positions, dtype=np.float64)
-        h = np.array(cell_h, dtype=np.float64).reshape((3, 3))
-        h_ih = np.linalg.inv(h)
-        h_flat = h.flatten()
-        ih_flat = h_ih.flatten()
-
-        # info(f" @CP2KSocketCommunicator: Starting i-PI protocol for charge {charge}", verbosity.medium)
-
-        # Step 1: Send STATUS to query CP2K state
-        client_socket.sendall(MESSAGE["status"])
-        # info(f" @CP2KSocketCommunicator: Sent STATUS to CP2K client {charge}", verbosity.debug)
-
-        # Step 2: Receive READY or HAVEDATA
-        header = client_socket.recv(HDRLEN)
-        header_str = header.decode('utf-8').strip()
-        # info(f" @CP2KSocketCommunicator: Received '{header_str}' from CP2K client {charge}", verbosity.debug)
-
-        if header_str == "READY":
-            # Send position data
-            posdata_msg = (
-                MESSAGE["posdata"] +
-                h_flat.tobytes() +
-                ih_flat.tobytes() +
-                np.int32(natoms).tobytes() +
-                positions_array.tobytes()
-            )
-            client_socket.sendall(posdata_msg)
-            # info(f" @CP2KSocketCommunicator: Sent POSDATA to CP2K client {charge}", verbosity.debug)
-
-        elif header_str == "HAVEDATA":
-            # info(f" @CP2KSocketCommunicator: CP2K client {charge} already has data", verbosity.debug)
-
-        else:
-            raise ValueError(f"Expected 'READY' or 'HAVEDATA', got '{header_str}'")
-
-        # Step 3: Send GETFORCE to request results
-        client_socket.sendall(MESSAGE["getforce"])
-        # info(f" @CP2KSocketCommunicator: Sent GETFORCE to CP2K client {charge}", verbosity.debug)
-
-        # Step 4: Wait for FORCEREADY
-        reply = client_socket.recv(HDRLEN)
-        if reply != MESSAGE["forceready"]:
-            raise ValueError(f"Expected 'forceready', got {reply}")
-        # info(f" @CP2KSocketCommunicator: Received FORCEREADY from CP2K client {charge}", verbosity.debug)
-
-        # Step 5: Receive calculation results
-        return self._receive_cp2k_results(client_socket, natoms, charge)
-
-    def _receive_cp2k_results(self, client_socket, natoms, charge):
-        """Receive and parse CP2K calculation results.
-
-        Args:
-            client_socket: Connected socket
-            natoms: Number of atoms
-            charge: Endpoint charge for logging
-
-        Returns:
-            dict: Parsed results
-        """
-        def recv_all(sock, dest):
-            """Receive all data for a numpy array."""
-            blen = dest.itemsize * dest.size
-            buf = np.zeros(blen, np.byte)
-            bpos = 0
-
-            while bpos < blen:
-                chunk = sock.recv(blen - bpos)
-                if not chunk:
-                    raise socket.error("Socket connection broken")
-                buf[bpos:bpos+len(chunk)] = np.frombuffer(chunk, dtype=np.byte)
-                bpos += len(chunk)
-
-            return np.frombuffer(buf, dtype=dest.dtype).reshape(dest.shape)
-
-        # Receive energy (1 float64)
-        energy_array = np.zeros(1, dtype=np.float64)
-        energy_array = recv_all(client_socket, energy_array)
-        energy = float(energy_array[0])
-
-        # Receive natoms confirmation (1 int32)
-        mlen_array = np.zeros(1, dtype=np.int32)
-        mlen_array = recv_all(client_socket, mlen_array)
-        received_natoms = int(mlen_array[0])
-
-        if received_natoms != natoms:
-            raise ValueError(f"Atom count mismatch: expected {natoms}, got {received_natoms}")
-
-        # Receive forces (3*natoms float64)
-        forces = np.zeros(3 * natoms, dtype=np.float64)
-        forces = recv_all(client_socket, forces)
-
-        # Receive virial (9 float64)
-        virial_flat = np.zeros(9, dtype=np.float64)
-        virial_flat = recv_all(client_socket, virial_flat)
-        virial = virial_flat.reshape((3, 3))
-
-        # Receive extra string length (1 int32)
-        extra_len_array = np.zeros(1, dtype=np.int32)
-        extra_len_array = recv_all(client_socket, extra_len_array)
-        extra_len = int(extra_len_array[0])
-
-        # Parse CP2K extras (JSON format)
-        fermi_level = None
-        converged = True
-        extra_dict = {}
-
-        if extra_len > 0:
-            extra_bytes = np.zeros(extra_len, dtype=np.dtype('S1'))
-            extra_bytes = recv_all(client_socket, extra_bytes)
-            extra_string = bytearray(extra_bytes).decode('utf-8')
-
-            try:
-                import json
-                extra_dict = json.loads(extra_string)
-
-                # Extract Fermi level from CP2K
-                if 'fermi_level_eV' in extra_dict:
-                    fermi_level = float(extra_dict['fermi_level_eV'])
-                elif 'fermi_level' in extra_dict:
-                    fermi_level = float(extra_dict['fermi_level'])
-
-                # Extract convergence status
-                if 'scf_converged' in extra_dict:
-                    converged = bool(extra_dict['scf_converged'])
-                elif 'converged' in extra_dict:
-                    converged = bool(extra_dict['converged'])
-
-                # info(f" @CP2KSocketCommunicator: Parsed CP2K extras {charge}: fermi={fermi_level} eV, converged={converged}", verbosity.debug)
-
-            except json.JSONDecodeError:
-                warning(f" @CP2KSocketCommunicator: Could not parse extra JSON: {extra_string[:100]}...", verbosity.medium)
-
-        # Convert Fermi level from eV to atomic units (Hartree) for i-PI
-        fermi_level_au = fermi_level / Constants.EV_PER_HARTREE if fermi_level is not None else None
-
-        # info(f" @CP2KSocketCommunicator: Results from charge {charge} - Energy: {energy:.6f} Ha, Fermi: {fermi_level} eV", verbosity.medium)
-
-        return {
-            "energy": energy,           # in Hartree
-            "forces": forces,           # in Hartree/Bohr
-            "virial": virial,          # in Hartree
-            "fermi_level": fermi_level, # in eV
-            "fermi_level_au": fermi_level_au,  # in Hartree
-            "charge": charge,
-            "converged": converged,
-            "is_real_data": True,
-            "data_source": "cp2k_socket",
-            "extras": extra_dict
-        }

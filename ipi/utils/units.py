@@ -27,7 +27,6 @@ class Constants(object):
         kb: Boltzmann constant.
         hbar: Reduced Planck's constant.
         amu: Atomic mass unit.
-        EV_PER_HARTREE: Conversion factor from Hartree to eV.
     """
 
     kb = 1.0
@@ -35,14 +34,7 @@ class Constants(object):
     amu = 1822.8885
     e = 1.0  # elementary charge, electron charge = - |e|
 
-    # Energy unit conversion (Hartree -> eV)
-    # NOTE: In ASE, eV=1 and Hartree=27.211..., so eV/Hartree would give 1/27.21.
-    # We want the physical factor "1 Hartree = 27.211386245988 eV" regardless of ASE.
-    try:
-        from ase.units import Hartree as ASE_Hartree
-        EV_PER_HARTREE = float(ASE_Hartree)  # ASE expresses Hartree in eV
-    except Exception:
-        EV_PER_HARTREE = 27.211386245988  # CODATA 2018 value
+    EV_PER_HARTREE = 27.211386245988
 
 
 class Elements(dict):
@@ -216,7 +208,7 @@ UnitMap = {
         "": 1.00,
         "automatic": 1.00,
         "atomic_unit": 1.00,
-        "electronvolt": 0.036749326,
+        "electronvolt": 1.0 / Constants.EV_PER_HARTREE,
         "j/mol": 0.00000038087989,
         "cal/mol": 0.0000015946679,
         "kelvin": 3.1668152e-06,
@@ -266,6 +258,12 @@ UnitMap = {
         "meter": 1.8897261e10,
         "radian": 1.00,
         "degree": 0.017453292519943295,
+    },
+    "action": {
+        "": 1.00,
+        "automatic": 1.00,
+        "atomic_unit": 1.00,
+        "joule*second": 9.4825216e33,
     },
     "volume": {
         "": 1.00,
@@ -320,6 +318,7 @@ if ase is not None:
     UnitMap["force"]["ase"] = UnitMap["energy"]["ase"] / UnitMap["length"]["ase"]
     UnitMap["volume"]["ase"] = UnitMap["length"]["ase"] ** 3
     UnitMap["frequency"]["ase"] = 1 / UnitMap["time"]["ase"]
+    UnitMap["action"]["ase"] = UnitMap["energy"]["ase"] * UnitMap["time"]["ase"]
     UnitMap["mass"]["ase"] = (
         UnitMap["energy"]["ase"] / UnitMap["velocity"]["ase"] ** 2
     )  # to check

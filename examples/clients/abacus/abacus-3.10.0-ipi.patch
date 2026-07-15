@@ -1,0 +1,1083 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 53cfeee..20754e5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -704,6 +704,7 @@ target_link_libraries(
+   parameter
+   cell
+   symmetry
++  ipi
+   md
+   planewave
+   surchem
+diff --git a/source/CMakeLists.txt b/source/CMakeLists.txt
+index 1f4d4a8..c0df882 100644
+--- a/source/CMakeLists.txt
++++ b/source/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_subdirectory(module_hsolver)
+ add_subdirectory(module_basis/module_ao)
+ add_subdirectory(module_basis/module_nao)
+ add_subdirectory(module_md)
++add_subdirectory(module_ipi)
+ add_subdirectory(module_basis/module_pw)
+ add_subdirectory(module_esolver)
+ add_subdirectory(module_hamilt_lcao/module_gint)
+diff --git a/source/driver_run.cpp b/source/driver_run.cpp
+index 8084106..3077159 100644
+--- a/source/driver_run.cpp
++++ b/source/driver_run.cpp
+@@ -6,6 +6,7 @@
+ #include "module_io/para_json.h"
+ #include "module_io/print_info.h"
+ #include "module_io/winput.h"
++#include "module_ipi/ipi_driver.h"
+ #include "module_md/run_md.h"
+ #include "module_parameter/parameter.h"
+ 
+@@ -67,6 +68,11 @@ void Driver::driver_run()
+     {
+         Run_MD::md_line(ucell, p_esolver, PARAM);
+     }
++    else if (cal_type == "driver")
++    {
++        ModuleIPI::IPIDriver ipi_driver;
++        ipi_driver.run(ucell, p_esolver);
++    }
+     else if (cal_type == "scf" || cal_type == "relax" || cal_type == "cell-relax" || cal_type == "nscf")
+     {
+         Relax_Driver rl_driver;
+diff --git a/source/module_io/read_input_item_system.cpp b/source/module_io/read_input_item_system.cpp
+index 58839c7..32ffac3 100644
+--- a/source/module_io/read_input_item_system.cpp
++++ b/source/module_io/read_input_item_system.cpp
+@@ -62,7 +62,7 @@ void ReadInput::item_system()
+     }
+     {
+         Input_Item item("calculation");
+-        item.annotation = "test; scf; relax; nscf; get_wf; get_pchg";
++        item.annotation = "test; scf; relax; nscf; get_wf; get_pchg; driver";
+         item.read_value = [](const Input_Item& item, Parameter& para) {
+             para.input.calculation = strvalue;
+             std::string& calculation = para.input.calculation;
+@@ -72,6 +72,7 @@ void ReadInput::item_system()
+             std::vector<std::string> callist = {"scf",
+                                                 "relax",
+                                                 "md",
++                                                "driver",
+                                                 "cell-relax",
+                                                 "test_memory",
+                                                 "test_neighbour",
+@@ -150,7 +151,7 @@ void ReadInput::item_system()
+                     para.input.symmetry = "1";
+                 }
+             }
+-            if (para.input.calculation == "md")
++            if (para.input.calculation == "md" || para.input.calculation == "driver")
+             {
+                 para.input.symmetry = "0";
+             }
+@@ -194,6 +195,10 @@ void ReadInput::item_system()
+                     para.input.cal_stress = true;
+                 }
+             }
++            else if (para.input.calculation == "driver")
++            {
++                para.input.cal_stress = true;
++            }
+             else if (para.input.calculation == "cell-relax")
+             {
+                 para.input.cal_stress = true;
+@@ -206,7 +211,7 @@ void ReadInput::item_system()
+         Input_Item item("cal_force");
+         item.annotation = "if calculate the force at the end of the electronic iteration";
+         item.reset_value = [](const Input_Item& item, Parameter& para) {
+-            std::vector<std::string> use_force = {"cell-relax", "relax", "md"};
++            std::vector<std::string> use_force = {"cell-relax", "relax", "md", "driver"};
+             std::vector<std::string> not_use_force = {"get_wf", "get_pchg", "get_S"};
+             if (std::find(use_force.begin(), use_force.end(), para.input.calculation) != use_force.end())
+             {
+@@ -228,6 +233,36 @@ void ReadInput::item_system()
+         read_sync_bool(input.cal_force);
+         this->add_item(item);
+     }
++    {
++        Input_Item item("ipi_host");
++        item.annotation = "i-PI socket host or Unix socket name/path";
++        read_sync_string(input.ipi_host);
++        this->add_item(item);
++    }
++    {
++        Input_Item item("ipi_port");
++        item.annotation = "i-PI inet socket port";
++        read_sync_int(input.ipi_port);
++        item.check_value = [](const Input_Item& item, const Parameter& para) {
++            if (para.input.ipi_port <= 0 || para.input.ipi_port > 65535)
++            {
++                ModuleBase::WARNING_QUIT("ReadInput", "ipi_port should be in [1, 65535]");
++            }
++        };
++        this->add_item(item);
++    }
++    {
++        Input_Item item("ipi_mode");
++        item.annotation = "i-PI socket mode: inet or unix";
++        read_sync_string(input.ipi_mode);
++        item.check_value = [](const Input_Item& item, const Parameter& para) {
++            if (para.input.ipi_mode != "inet" && para.input.ipi_mode != "unix")
++            {
++                ModuleBase::WARNING_QUIT("ReadInput", "ipi_mode should be 'inet' or 'unix'");
++            }
++        };
++        this->add_item(item);
++    }
+     {
+         Input_Item item("kpar");
+         item.annotation = "devide all processors into kpar groups and k points "
+@@ -575,7 +610,8 @@ void ReadInput::item_system()
+         item.annotation = "atomic; first-order; second-order; dm:coefficients of SIA";
+         read_sync_string(input.chg_extrap);
+         item.reset_value = [](const Input_Item& item, Parameter& para) {
+-            if (para.input.chg_extrap == "default" && para.input.calculation == "md")
++            if (para.input.chg_extrap == "default"
++                && (para.input.calculation == "md" || para.input.calculation == "driver"))
+             {
+                 para.input.chg_extrap = "second-order";
+             }
+@@ -791,4 +827,4 @@ void ReadInput::item_system()
+     }
+ }
+ 
+-} // namespace ModuleIO
+\ No newline at end of file
++} // namespace ModuleIO
+diff --git a/source/module_ipi/CMakeLists.txt b/source/module_ipi/CMakeLists.txt
+new file mode 100644
+index 0000000..c844c4f
+--- /dev/null
++++ b/source/module_ipi/CMakeLists.txt
+@@ -0,0 +1,10 @@
++add_library(
++    ipi
++    OBJECT
++    ipi_driver.cpp
++    ipi_protocol.cpp
++)
++
++if(ENABLE_COVERAGE)
++  add_coverage(ipi)
++endif()
+diff --git a/source/module_ipi/ipi_driver.cpp b/source/module_ipi/ipi_driver.cpp
+new file mode 100644
+index 0000000..20519f7
+--- /dev/null
++++ b/source/module_ipi/ipi_driver.cpp
+@@ -0,0 +1,472 @@
++#include "ipi_driver.h"
++
++#include "module_base/global_file.h"
++#include "module_base/global_variable.h"
++#include "module_base/parallel_common.h"
++#include "module_base/tool_quit.h"
++#include "module_cell/update_cell.h"
++#include "module_parameter/parameter.h"
++
++#include <algorithm>
++#include <cmath>
++#include <iomanip>
++#include <limits>
++#include <sstream>
++
++namespace ModuleIPI
++{
++namespace
++{
++const int ROOT_RANK = 0;
++const double CELL_TOL = 1.0e-10;
++const std::int32_t MAX_INIT_BYTES = 1024 * 1024;
++
++bool is_root()
++{
++    return GlobalV::MY_RANK == ROOT_RANK;
++}
++
++void broadcast_int(int& value)
++{
++#ifdef __MPI
++    Parallel_Common::bcast_int(value);
++#endif
++}
++
++void broadcast_int32(std::int32_t& value)
++{
++    int tmp = static_cast<int>(value);
++    broadcast_int(tmp);
++    value = static_cast<std::int32_t>(tmp);
++}
++
++void broadcast_double(double& value)
++{
++#ifdef __MPI
++    Parallel_Common::bcast_double(value);
++#endif
++}
++
++void broadcast_double_array(double* data, int count)
++{
++#ifdef __MPI
++    if (count > 0)
++    {
++        Parallel_Common::bcast_double(data, count);
++    }
++#endif
++}
++
++double cell_component(const ModuleBase::Matrix3& matrix, int i, int j)
++{
++    if (i == 0 && j == 0) return matrix.e11;
++    if (i == 0 && j == 1) return matrix.e12;
++    if (i == 0 && j == 2) return matrix.e13;
++    if (i == 1 && j == 0) return matrix.e21;
++    if (i == 1 && j == 1) return matrix.e22;
++    if (i == 1 && j == 2) return matrix.e23;
++    if (i == 2 && j == 0) return matrix.e31;
++    if (i == 2 && j == 1) return matrix.e32;
++    return matrix.e33;
++}
++
++void set_cell_component(ModuleBase::Matrix3& matrix, int i, int j, double value)
++{
++    if (i == 0 && j == 0) matrix.e11 = value;
++    else if (i == 0 && j == 1) matrix.e12 = value;
++    else if (i == 0 && j == 2) matrix.e13 = value;
++    else if (i == 1 && j == 0) matrix.e21 = value;
++    else if (i == 1 && j == 1) matrix.e22 = value;
++    else if (i == 1 && j == 2) matrix.e23 = value;
++    else if (i == 2 && j == 0) matrix.e31 = value;
++    else if (i == 2 && j == 1) matrix.e32 = value;
++    else matrix.e33 = value;
++}
++
++std::string message_name(MessageType type)
++{
++    switch (type)
++    {
++    case MessageType::Status: return "STATUS";
++    case MessageType::Init: return "INIT";
++    case MessageType::PosData: return "POSDATA";
++    case MessageType::GetForce: return "GETFORCE";
++    case MessageType::Exit: return "EXIT";
++    default: return "UNKNOWN";
++    }
++}
++} // namespace
++
++void IPIDriver::run(UnitCell& ucell, ModuleESolver::ESolver* p_esolver)
++{
++    ModuleBase::TITLE("IPIDriver", "run");
++
++    if (p_esolver == nullptr)
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::run", "ESolver pointer is null");
++    }
++
++    IpiSocket socket;
++    connect_socket_if_root(socket);
++
++    bool needs_init = true;
++    bool has_data = false;
++    bool stop = false;
++    int istep = 0;
++    ForceResult result;
++
++    while (!stop)
++    {
++        std::string raw_header;
++        const MessageType message = receive_message(socket, raw_header);
++        if (is_root())
++        {
++            GlobalV::ofs_running << " @IPI DRIVER: Message from i-PI: " << trim_header(raw_header) << std::endl;
++        }
++
++        switch (message)
++        {
++        case MessageType::Status:
++            if (is_root())
++            {
++                if (needs_init)
++                {
++                    socket.send_header("NEEDINIT");
++                }
++                else if (has_data)
++                {
++                    socket.send_header("HAVEDATA");
++                }
++                else
++                {
++                    socket.send_header("READY");
++                }
++            }
++            break;
++
++        case MessageType::Init:
++            handle_init(socket);
++            needs_init = false;
++            break;
++
++        case MessageType::PosData:
++            if (needs_init)
++            {
++                ModuleBase::WARNING_QUIT("IPIDriver::run", "received POSDATA before INIT");
++            }
++            if (has_data)
++            {
++                ModuleBase::WARNING_QUIT("IPIDriver::run", "received POSDATA while previous force data are still pending");
++            }
++            receive_posdata(socket, ucell);
++            compute_force(ucell, p_esolver, istep, result);
++            has_data = true;
++            ++istep;
++            break;
++
++        case MessageType::GetForce:
++            if (!has_data || !result.valid)
++            {
++                ModuleBase::WARNING_QUIT("IPIDriver::run", "received GETFORCE before force data were computed");
++            }
++            send_force(socket, ucell, result);
++            result.valid = false;
++            has_data = false;
++            break;
++
++        case MessageType::Exit:
++            stop = true;
++            break;
++
++        default:
++            ModuleBase::WARNING_QUIT("IPIDriver::run", "unknown i-PI message header: " + trim_header(raw_header));
++        }
++    }
++
++    socket.close_socket();
++    if (is_root())
++    {
++        GlobalV::ofs_running << " @IPI DRIVER: Exiting i-PI driver loop." << std::endl;
++    }
++}
++
++void IPIDriver::connect_socket_if_root(IpiSocket& socket) const
++{
++    if (!is_root())
++    {
++        return;
++    }
++
++    GlobalV::ofs_running << " @IPI DRIVER: Connecting to i-PI using mode=" << PARAM.inp.ipi_mode
++                         << " host=" << PARAM.inp.ipi_host
++                         << " port=" << PARAM.inp.ipi_port << std::endl;
++    socket.connect_socket(PARAM.inp.ipi_mode, PARAM.inp.ipi_host, PARAM.inp.ipi_port);
++    GlobalV::ofs_running << " @IPI DRIVER: Connected to i-PI." << std::endl;
++}
++
++MessageType IPIDriver::receive_message(IpiSocket& socket, std::string& raw_header) const
++{
++    int message_value = static_cast<int>(MessageType::Unknown);
++    if (is_root())
++    {
++        const MessageType message = socket.recv_header(raw_header);
++        message_value = static_cast<int>(message);
++    }
++    broadcast_int(message_value);
++
++    if (!is_root())
++    {
++        raw_header = make_header(message_name(static_cast<MessageType>(message_value)));
++    }
++    return static_cast<MessageType>(message_value);
++}
++
++void IPIDriver::handle_init(IpiSocket& socket) const
++{
++    std::int32_t rid = 0;
++    std::int32_t init_len = 0;
++    std::string init_string;
++    if (is_root())
++    {
++        socket.read_int32(rid);
++        socket.read_int32(init_len);
++        if (init_len < 0 || init_len > MAX_INIT_BYTES)
++        {
++            ModuleBase::WARNING_QUIT("IPIDriver::handle_init",
++                                     "INIT string length must be between 0 and 1 MiB");
++        }
++        socket.read_string(init_string, static_cast<std::size_t>(init_len));
++        GlobalV::ofs_running << " @IPI DRIVER: Received INIT rid=" << rid
++                             << " length=" << init_len << std::endl;
++        if (!init_string.empty())
++        {
++            GlobalV::ofs_running << " @IPI DRIVER: INIT string: " << init_string << std::endl;
++        }
++
++    }
++}
++
++void IPIDriver::receive_posdata(IpiSocket& socket, UnitCell& ucell)
++{
++    std::int32_t nat = 0;
++    std::vector<double> cell_h(9, 0.0);
++    std::vector<double> cell_ih(9, 0.0);
++    std::vector<double> positions;
++
++    if (is_root())
++    {
++        socket.read_float64_array(cell_h.data(), cell_h.size());
++        socket.read_float64_array(cell_ih.data(), cell_ih.size());
++        socket.read_int32(nat);
++        if (nat <= 0)
++        {
++            ModuleBase::WARNING_QUIT("IPIDriver::receive_posdata", "received non-positive atom count from i-PI");
++        }
++        if (nat != ucell.nat)
++        {
++            std::ostringstream oss;
++            oss << "i-PI atom count " << nat << " differs from ABACUS STRU atom count " << ucell.nat;
++            ModuleBase::WARNING_QUIT("IPIDriver::receive_posdata", oss.str());
++        }
++        positions.resize(static_cast<std::size_t>(3 * nat));
++        socket.read_float64_array(positions.data(), positions.size());
++
++        if (!std::all_of(cell_h.begin(), cell_h.end(), [](double value) { return std::isfinite(value); })
++            || !std::all_of(cell_ih.begin(), cell_ih.end(), [](double value) { return std::isfinite(value); })
++            || !std::all_of(positions.begin(), positions.end(), [](double value) { return std::isfinite(value); }))
++        {
++            ModuleBase::WARNING_QUIT("IPIDriver::receive_posdata",
++                                     "POSDATA cell, inverse cell, and positions must be finite");
++        }
++    }
++
++    broadcast_posdata(cell_h, positions, nat);
++
++    if (nat != ucell.nat)
++    {
++        std::ostringstream oss;
++        oss << "i-PI atom count " << nat << " differs from ABACUS STRU atom count " << ucell.nat;
++        ModuleBase::WARNING_QUIT("IPIDriver::receive_posdata", oss.str());
++    }
++
++    update_cell(ucell, cell_h);
++    update_positions(ucell, positions);
++}
++
++void IPIDriver::broadcast_posdata(std::vector<double>& cell_h, std::vector<double>& positions, std::int32_t& nat) const
++{
++    broadcast_int32(nat);
++    if (!is_root())
++    {
++        cell_h.assign(9, 0.0);
++        if (nat > 0)
++        {
++            positions.assign(static_cast<std::size_t>(3 * nat), 0.0);
++        }
++    }
++    broadcast_double_array(cell_h.data(), static_cast<int>(cell_h.size()));
++    if (!positions.empty())
++    {
++        broadcast_double_array(positions.data(), static_cast<int>(positions.size()));
++    }
++}
++
++void IPIDriver::update_cell(UnitCell& ucell, const std::vector<double>& cell_h) const
++{
++    if (cell_h.size() != 9 || ucell.lat0 <= 0.0 || !std::isfinite(ucell.lat0))
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::update_cell", "invalid cell matrix or ABACUS lat0");
++    }
++
++    bool changed = false;
++    for (int i = 0; i < 3; ++i)
++    {
++        for (int j = 0; j < 3; ++j)
++        {
++            const double old_value = ucell.lat0 * cell_component(ucell.latvec, i, j);
++            const double new_value = cell_h[3 * i + j];
++            if (std::abs(old_value - new_value) > CELL_TOL)
++            {
++                changed = true;
++            }
++        }
++    }
++
++    if (!changed)
++    {
++        return;
++    }
++
++    for (int i = 0; i < 3; ++i)
++    {
++        for (int j = 0; j < 3; ++j)
++        {
++            set_cell_component(ucell.latvec, i, j, cell_h[3 * i + j] / ucell.lat0);
++        }
++    }
++
++    ucell.cell_parameter_updated = true;
++    unitcell::setup_cell_after_vc(ucell, GlobalV::ofs_running);
++}
++
++void IPIDriver::update_positions(UnitCell& ucell, const std::vector<double>& positions) const
++{
++    if (positions.size() != static_cast<std::size_t>(3 * ucell.nat))
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::update_positions", "invalid POSDATA position array size");
++    }
++
++    int iat = 0;
++    for (int it = 0; it < ucell.ntype; ++it)
++    {
++        Atom* atom = &ucell.atoms[it];
++        for (int ia = 0; ia < atom->na; ++ia)
++        {
++            ModuleBase::Vector3<double> new_tau;
++            for (int ik = 0; ik < 3; ++ik)
++            {
++                new_tau[ik] = positions[3 * iat + ik] / ucell.lat0;
++                atom->dis[ia][ik] = new_tau[ik] - atom->tau[ia][ik];
++                atom->tau[ia][ik] = new_tau[ik];
++            }
++            atom->taud[ia] = atom->tau[ia] * ucell.GT;
++            ++iat;
++        }
++    }
++    if (iat != ucell.nat)
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::update_positions", "internal atom count mismatch");
++    }
++
++    unitcell::periodic_boundary_adjustment(ucell.atoms, ucell.latvec, ucell.ntype);
++    ucell.bcast_atoms_tau();
++    ucell.ionic_position_updated = true;
++}
++
++void IPIDriver::compute_force(UnitCell& ucell, ModuleESolver::ESolver* p_esolver, int istep, ForceResult& result) const
++{
++    if (p_esolver == nullptr)
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::compute_force", "ESolver pointer is null");
++    }
++    p_esolver->runner(ucell, istep);
++    if (!p_esolver->conv_esolver)
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::compute_force",
++                                 "electronic calculation did not reach the requested SCF convergence");
++    }
++
++    result.energy = 0.5 * p_esolver->cal_energy();
++    if (!std::isfinite(result.energy))
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::compute_force", "ABACUS energy is not finite");
++    }
++    result.forces.assign(static_cast<std::size_t>(3 * ucell.nat), 0.0);
++
++    ModuleBase::matrix force_temp(ucell.nat, 3);
++    p_esolver->cal_force(ucell, force_temp);
++    for (int iat = 0; iat < ucell.nat; ++iat)
++    {
++        for (int idir = 0; idir < 3; ++idir)
++        {
++            const double force = 0.5 * force_temp(iat, idir);
++            if (!std::isfinite(force))
++            {
++                ModuleBase::WARNING_QUIT("IPIDriver::compute_force", "ABACUS force is not finite");
++            }
++            result.forces[3 * iat + idir] = force;
++        }
++    }
++
++    std::fill(result.virial, result.virial + 9, 0.0);
++    if (PARAM.inp.cal_stress)
++    {
++        if (!std::isfinite(ucell.omega) || ucell.omega <= 0.0)
++        {
++            ModuleBase::WARNING_QUIT("IPIDriver::compute_force", "ABACUS cell volume is not finite and positive");
++        }
++        ModuleBase::matrix stress_temp;
++        p_esolver->cal_stress(ucell, stress_temp);
++        for (int i = 0; i < 3; ++i)
++        {
++            for (int j = 0; j < 3; ++j)
++            {
++                const double virial = 0.5 * stress_temp(i, j) * ucell.omega;
++                if (!std::isfinite(virial))
++                {
++                    ModuleBase::WARNING_QUIT("IPIDriver::compute_force", "ABACUS virial is not finite");
++                }
++                result.virial[3 * i + j] = virial;
++            }
++        }
++    }
++
++    result.extras = "{}";
++    result.valid = true;
++}
++
++void IPIDriver::send_force(IpiSocket& socket, const UnitCell& ucell, const ForceResult& result) const
++{
++    if (!is_root())
++    {
++        return;
++    }
++
++    socket.send_header("FORCEREADY");
++    socket.write_float64(result.energy);
++    socket.write_int32(static_cast<std::int32_t>(ucell.nat));
++    socket.write_float64_array(result.forces.data(), result.forces.size());
++    socket.write_float64_array(result.virial, 9);
++    if (result.extras.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::send_force", "extras JSON is too large for i-PI protocol");
++    }
++    socket.write_int32(static_cast<std::int32_t>(result.extras.size()));
++    socket.write_string(result.extras);
++
++    GlobalV::ofs_running << " @IPI DRIVER: Sent force data to i-PI. energy(Ha)="
++                         << std::setprecision(12) << result.energy
++                         << " extras=" << result.extras << std::endl;
++}
++
++} // namespace ModuleIPI
+diff --git a/source/module_ipi/ipi_driver.h b/source/module_ipi/ipi_driver.h
+new file mode 100644
+index 0000000..0701736
+--- /dev/null
++++ b/source/module_ipi/ipi_driver.h
+@@ -0,0 +1,44 @@
++#ifndef MODULE_IPI_DRIVER_H
++#define MODULE_IPI_DRIVER_H
++
++#include "module_base/matrix.h"
++#include "module_base/vector3.h"
++#include "module_cell/unitcell.h"
++#include "module_esolver/esolver.h"
++#include "module_ipi/ipi_protocol.h"
++
++#include <string>
++#include <vector>
++
++namespace ModuleIPI
++{
++
++class IPIDriver
++{
++  public:
++    void run(UnitCell& ucell, ModuleESolver::ESolver* p_esolver);
++
++  private:
++    struct ForceResult
++    {
++        double energy = 0.0;
++        std::vector<double> forces;
++        double virial[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
++        std::string extras;
++        bool valid = false;
++    };
++
++    void connect_socket_if_root(IpiSocket& socket) const;
++    MessageType receive_message(IpiSocket& socket, std::string& raw_header) const;
++    void handle_init(IpiSocket& socket) const;
++    void receive_posdata(IpiSocket& socket, UnitCell& ucell);
++    void update_cell(UnitCell& ucell, const std::vector<double>& cell_h) const;
++    void update_positions(UnitCell& ucell, const std::vector<double>& positions) const;
++    void compute_force(UnitCell& ucell, ModuleESolver::ESolver* p_esolver, int istep, ForceResult& result) const;
++    void send_force(IpiSocket& socket, const UnitCell& ucell, const ForceResult& result) const;
++    void broadcast_posdata(std::vector<double>& cell_h, std::vector<double>& positions, std::int32_t& nat) const;
++};
++
++} // namespace ModuleIPI
++
++#endif // MODULE_IPI_DRIVER_H
+diff --git a/source/module_ipi/ipi_protocol.cpp b/source/module_ipi/ipi_protocol.cpp
+new file mode 100644
+index 0000000..affd2a2
+--- /dev/null
++++ b/source/module_ipi/ipi_protocol.cpp
+@@ -0,0 +1,302 @@
++#include "ipi_protocol.h"
++
++#include "module_base/tool_quit.h"
++
++#include <cerrno>
++#include <cstring>
++#include <netdb.h>
++#include <stdexcept>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++namespace ModuleIPI
++{
++namespace
++{
++const std::size_t HDRLEN = 12;
++
++std::string socket_error(const std::string& prefix)
++{
++    return prefix + ": " + std::strerror(errno);
++}
++
++void quit_with_error(const std::string& where, const std::string& message)
++{
++    ModuleBase::WARNING_QUIT(where, message);
++}
++} // namespace
++
++IpiSocket::IpiSocket() : fd_(-1)
++{
++}
++
++IpiSocket::~IpiSocket()
++{
++    close_socket();
++}
++
++void IpiSocket::connect_socket(const std::string& mode, const std::string& host, int port)
++{
++    close_socket();
++
++    if (mode == "inet")
++    {
++        struct addrinfo hints;
++        std::memset(&hints, 0, sizeof(hints));
++        hints.ai_family = AF_INET;
++        hints.ai_socktype = SOCK_STREAM;
++
++        struct addrinfo* result = nullptr;
++        const std::string port_str = std::to_string(port);
++        const int gai = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
++        if (gai != 0)
++        {
++            quit_with_error("IpiSocket::connect_socket", std::string("getaddrinfo failed: ") + gai_strerror(gai));
++        }
++
++        for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next)
++        {
++            fd_ = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
++            if (fd_ == -1)
++            {
++                continue;
++            }
++            if (::connect(fd_, rp->ai_addr, rp->ai_addrlen) == 0)
++            {
++                break;
++            }
++            close_socket();
++        }
++        freeaddrinfo(result);
++
++        if (fd_ == -1)
++        {
++            quit_with_error("IpiSocket::connect_socket", socket_error("cannot connect inet socket"));
++        }
++    }
++    else if (mode == "unix")
++    {
++        fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
++        if (fd_ == -1)
++        {
++            quit_with_error("IpiSocket::connect_socket", socket_error("cannot create unix socket"));
++        }
++
++        std::string path = host;
++        if (path.empty())
++        {
++            path = "localhost";
++        }
++        if (path[0] != '/')
++        {
++            path = "/tmp/ipi_" + path;
++        }
++
++        struct sockaddr_un addr;
++        std::memset(&addr, 0, sizeof(addr));
++        addr.sun_family = AF_UNIX;
++        if (path.size() >= sizeof(addr.sun_path))
++        {
++            quit_with_error("IpiSocket::connect_socket", "unix socket path is too long: " + path);
++        }
++        std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
++
++        if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0)
++        {
++            const std::string msg = socket_error("cannot connect unix socket " + path);
++            close_socket();
++            quit_with_error("IpiSocket::connect_socket", msg);
++        }
++    }
++    else
++    {
++        quit_with_error("IpiSocket::connect_socket", "ipi_mode must be 'inet' or 'unix', got '" + mode + "'");
++    }
++}
++
++void IpiSocket::close_socket()
++{
++    if (fd_ >= 0)
++    {
++        ::close(fd_);
++        fd_ = -1;
++    }
++}
++
++MessageType IpiSocket::recv_header(std::string& raw_header)
++{
++    char buf[HDRLEN];
++    read_exact(buf, HDRLEN);
++    raw_header.assign(buf, HDRLEN);
++    return parse_header(raw_header);
++}
++
++void IpiSocket::send_header(const std::string& header)
++{
++    const std::string wire = make_header(header);
++    write_exact(wire.data(), wire.size());
++}
++
++void IpiSocket::read_int32(std::int32_t& value)
++{
++    read_exact(&value, sizeof(value));
++}
++
++void IpiSocket::read_float64(double& value)
++{
++    read_exact(&value, sizeof(value));
++}
++
++void IpiSocket::read_float64_array(double* data, std::size_t count)
++{
++    if (count > 0)
++    {
++        read_exact(data, count * sizeof(double));
++    }
++}
++
++void IpiSocket::read_string(std::string& value, std::size_t count)
++{
++    value.assign(count, '\0');
++    if (count > 0)
++    {
++        read_exact(&value[0], count);
++    }
++}
++
++void IpiSocket::write_int32(std::int32_t value)
++{
++    write_exact(&value, sizeof(value));
++}
++
++void IpiSocket::write_float64(double value)
++{
++    write_exact(&value, sizeof(value));
++}
++
++void IpiSocket::write_float64_array(const double* data, std::size_t count)
++{
++    if (count > 0)
++    {
++        write_exact(data, count * sizeof(double));
++    }
++}
++
++void IpiSocket::write_string(const std::string& value)
++{
++    if (!value.empty())
++    {
++        write_exact(value.data(), value.size());
++    }
++}
++
++void IpiSocket::read_exact(void* data, std::size_t bytes)
++{
++    char* ptr = static_cast<char*>(data);
++    std::size_t done = 0;
++    while (done < bytes)
++    {
++        const ssize_t nread = ::read(fd_, ptr + done, bytes - done);
++        if (nread == 0)
++        {
++            quit_with_error("IpiSocket::read_exact", "socket closed by peer");
++        }
++        if (nread < 0)
++        {
++            if (errno == EINTR)
++            {
++                continue;
++            }
++            quit_with_error("IpiSocket::read_exact", socket_error("socket read failed"));
++        }
++        done += static_cast<std::size_t>(nread);
++    }
++}
++
++void IpiSocket::write_exact(const void* data, std::size_t bytes)
++{
++    const char* ptr = static_cast<const char*>(data);
++    std::size_t done = 0;
++    while (done < bytes)
++    {
++        const ssize_t nwritten = ::write(fd_, ptr + done, bytes - done);
++        if (nwritten == 0)
++        {
++            quit_with_error("IpiSocket::write_exact", "socket closed while writing");
++        }
++        if (nwritten < 0)
++        {
++            if (errno == EINTR)
++            {
++                continue;
++            }
++            quit_with_error("IpiSocket::write_exact", socket_error("socket write failed"));
++        }
++        done += static_cast<std::size_t>(nwritten);
++    }
++}
++
++std::string make_header(const std::string& text)
++{
++    std::string header = text;
++    for (std::size_t i = 0; i < header.size(); ++i)
++    {
++        if (header[i] >= 'a' && header[i] <= 'z')
++        {
++            header[i] = static_cast<char>(header[i] - 'a' + 'A');
++        }
++    }
++    if (header.size() > HDRLEN)
++    {
++        header.resize(HDRLEN);
++    }
++    else
++    {
++        header.append(HDRLEN - header.size(), ' ');
++    }
++    return header;
++}
++
++std::string trim_header(const std::string& text)
++{
++    std::size_t begin = 0;
++    while (begin < text.size() && text[begin] == ' ')
++    {
++        ++begin;
++    }
++    std::size_t end = text.size();
++    while (end > begin && text[end - 1] == ' ')
++    {
++        --end;
++    }
++    return text.substr(begin, end - begin);
++}
++
++MessageType parse_header(const std::string& raw_header)
++{
++    const std::string header = trim_header(raw_header);
++    if (header == "STATUS")
++    {
++        return MessageType::Status;
++    }
++    if (header == "INIT")
++    {
++        return MessageType::Init;
++    }
++    if (header == "POSDATA")
++    {
++        return MessageType::PosData;
++    }
++    if (header == "GETFORCE")
++    {
++        return MessageType::GetForce;
++    }
++    if (header == "EXIT")
++    {
++        return MessageType::Exit;
++    }
++    return MessageType::Unknown;
++}
++
++} // namespace ModuleIPI
+diff --git a/source/module_ipi/ipi_protocol.h b/source/module_ipi/ipi_protocol.h
+new file mode 100644
+index 0000000..2db2338
+--- /dev/null
++++ b/source/module_ipi/ipi_protocol.h
+@@ -0,0 +1,59 @@
++#ifndef MODULE_IPI_PROTOCOL_H
++#define MODULE_IPI_PROTOCOL_H
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace ModuleIPI
++{
++
++enum class MessageType
++{
++    Status,
++    Init,
++    PosData,
++    GetForce,
++    Exit,
++    Unknown
++};
++
++class IpiSocket
++{
++  public:
++    IpiSocket();
++    ~IpiSocket();
++
++    IpiSocket(const IpiSocket&) = delete;
++    IpiSocket& operator=(const IpiSocket&) = delete;
++
++    void connect_socket(const std::string& mode, const std::string& host, int port);
++    void close_socket();
++
++    MessageType recv_header(std::string& raw_header);
++    void send_header(const std::string& header);
++
++    void read_int32(std::int32_t& value);
++    void read_float64(double& value);
++    void read_float64_array(double* data, std::size_t count);
++    void read_string(std::string& value, std::size_t count);
++
++    void write_int32(std::int32_t value);
++    void write_float64(double value);
++    void write_float64_array(const double* data, std::size_t count);
++    void write_string(const std::string& value);
++
++  private:
++    int fd_;
++
++    void read_exact(void* data, std::size_t bytes);
++    void write_exact(const void* data, std::size_t bytes);
++};
++
++std::string make_header(const std::string& text);
++std::string trim_header(const std::string& text);
++MessageType parse_header(const std::string& raw_header);
++
++} // namespace ModuleIPI
++
++#endif // MODULE_IPI_PROTOCOL_H
+diff --git a/source/module_parameter/input_parameter.h b/source/module_parameter/input_parameter.h
+index 0bb1979..04136a3 100644
+--- a/source/module_parameter/input_parameter.h
++++ b/source/module_parameter/input_parameter.h
+@@ -56,6 +56,9 @@ struct Input_para
+     std::string stru_file = "STRU";     ///< file contains atomic positions --
+                                         ///< xiaohui modify 2015-02-01
+     std::string kpoint_file = "KPT";    ///< file contains k-points -- xiaohui modify 2015-02-01
++    std::string ipi_host = "localhost"; ///< i-PI socket host or Unix socket name/path
++    int ipi_port = 31415;               ///< i-PI inet socket port
++    std::string ipi_mode = "inet";      ///< i-PI socket mode: inet or unix
+     std::string pseudo_dir = "";        ///< directory of pseudopotential
+     std::string orbital_dir = "";       ///< directory of orbital file
+     std::string read_file_dir = "auto"; ///< directory of files for reading

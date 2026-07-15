@@ -1,0 +1,52 @@
+<simulation verbosity="low">
+  <output prefix="simulation">
+    <properties stride="1" filename="out">[step, time{femtosecond}, potential{electronvolt}, conserved{electronvolt},temperature{kelvin}, electronic_charge,fermi_level{electronvolt}, workfunction{electronvolt},workfunction_steps_average{electronvolt}, workfunction_target{electronvolt},Grand_canonical_potential{electronvolt}]</properties>
+    <trajectory filename="positions" stride="1" format="xyz" cell_units="angstrom">positions{angstrom}</trajectory>
+    <checkpoint filename="restart" stride="1" overwrite="True"/>
+  </output>
+  <total_steps>100</total_steps>
+  <prng>
+    <seed>31245</seed>
+  </prng>
+
+  <ffsocket name="vasp_ne" mode="inet" pbc="true">
+    <address>localhost</address>
+	<port>17004</port>
+    <timeout>20000</timeout>
+    <consolidate_messages>true</consolidate_messages>
+    <batch_size>1</batch_size>
+  </ffsocket>
+  
+  <system>
+    <initialize nbeads="1">
+      <file mode="xyz" units="angstrom">init.xyz</file>
+      <cell mode='abcABC' units="angstrom">[11.2201, 11.2201, 40.0, 90.0, 90.0, 120.0]</cell>
+      <velocities mode="thermal" units="kelvin">300.0</velocities>
+    </initialize>
+    <forces><force forcefield="vasp_ne"/></forces>
+    <ensemble><temperature units="kelvin">300.0</temperature></ensemble>
+	
+    <motion mode="dynamics">
+      <fixatoms>[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190]</fixatoms>
+      <dynamics mode="nvt" splitting="baoab">
+        <timestep units="femtosecond">0.5</timestep>
+        <thermostat mode="svr"><tau units="femtosecond">200.0</tau></thermostat>
+		
+        <electrons enabled="true" Ne_doping="true">
+          <target_workfunction units="electronvolt">5.0</target_workfunction>
+          <potential_average_axis>z</potential_average_axis>
+          <potential_average_region units="angstrom">[27.0, 30.0]</potential_average_region>
+          <neutral_electrons>945</neutral_electrons>
+          <q_init>945.0</q_init>
+          <mass units="atomic_unit">400.0</mass>
+          <workfunction_average_steps>1</workfunction_average_steps>
+          <potentiostat mode="svr">
+            <tau units="femtosecond">200.0</tau>
+            <temp units="kelvin">300.0</temp>
+          </potentiostat>
+        </electrons>
+		
+      </dynamics>
+    </motion>
+  </system>
+</simulation>

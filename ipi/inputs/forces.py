@@ -103,14 +103,15 @@ class InputForceComponent(Input):
            forceb: A ForceComponent object.
         """
 
-        super(InputForceComponent, self).store(forceb.ffield)
+        ffield = getattr(forceb, "_charge_mixing_original_ffield", forceb.ffield)
+        super(InputForceComponent, self).store(ffield)
         self.nbeads.store(forceb.nbeads)
         self.weight.store(forceb.weight)
         self.mts_weights.store(forceb.mts_weights)
         self.interpolate_extras.store(forceb.interpolate_extras)
         self.fd_epsilon.store(forceb.epsilon)
         self.name.store(forceb.name)
-        self.forcefield.store(forceb.ffield)
+        self.forcefield.store(ffield)
 
     def fetch(self):
         """Creates a ForceComponent object.
