@@ -8,7 +8,7 @@ basis_type          pw
 ecutwfc             60
 scf_thr             1e-5
 scf_ene_thr         1e-5
-scf_nmax            100
+scf_nmax            200
 ks_solver           cg
 diago_smooth_ethr   1
 smearing_method     gauss
@@ -18,14 +18,25 @@ mixing_beta         0.20
 mixing_ndim         8
 mixing_gg0          1.0
 
-imp_sol             1
-eb_k                80
-tau                 0.000010798
-sigma_k             0.6
-nc_k                0.00037
-
 cal_force           1
 cal_stress          0
+
+
+imp_sol             0
+
+efield_flag         1
+dip_cor_flag        1
+efield_dir          1
+efield_pos_max      0.8
+efield_pos_dec      0.1
+efield_amp          0
+
+gate_flag           1
+zgate               0.4
+block               1
+block_down          0.4
+block_up            0.5
+block_height        0.10
 
 ipi_mode            inet
 ipi_host            localhost

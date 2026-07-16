@@ -8,7 +8,7 @@ on:
     # Check all PR
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -27,11 +27,3 @@ jobs:
           tox -e docs
           tox -e docs-pdf
           cp docs/_build/latex/i-pi.pdf docs/_build/html/ipi-manual.pdf
-      - name: deploy to gh-pages
-        if: github.event_name == 'push'
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs/_build/html/
-          force_orphan: true
-          cname: docs.ipi-code.org

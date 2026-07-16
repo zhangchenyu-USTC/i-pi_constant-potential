@@ -29,5 +29,5 @@ constant_potential/2-vasp-implicit
 constant_potential/3-vasp-Ne
 constant_potential/4-cp2k-implicit-mixing
 constant_potential/5-cp2k-Ne
-constant_potential/6-abacus-pw-implicit
-constant_potential/7-abacus-lcao-implicit
+constant_potential/6-abacus-pw-compensating-charge
+constant_potential/7-abacus-lcao-compensating-charge

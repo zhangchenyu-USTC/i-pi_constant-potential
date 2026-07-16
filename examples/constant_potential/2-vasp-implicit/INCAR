@@ -25,10 +25,12 @@ LPLANE = .TRUE.
 LSCALU = .FALSE.
 LASPH  = .TRUE.
 ADDGRID= .TRUE.
-LVHAR  = .TRUE. 
+LVHAR  = .FALSE.
 
 LSOL      = .TRUE.
 ISOL      = 2
+C_MOLAR   = 1.0
+R_ION     = 4.0
 LSOL_SCF  = .TRUE.  
 EB_K      = 78.4
 NC_K      = 0.015

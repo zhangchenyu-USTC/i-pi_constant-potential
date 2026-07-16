@@ -1,20 +1,21 @@
 <simulation verbosity="low">
   <output prefix="simulation">
-    <properties stride="1" filename="out">[step, time{femtosecond}, potential{electronvolt}, conserved{electronvolt},temperature{kelvin}, electronic_charge,fermi_level{electronvolt}, workfunction{electronvolt},workfunction_target{electronvolt}, Grand_canonical_potential{electronvolt}]</properties>
+    <properties stride="1" filename="out">[step, time{femtosecond}, potential{electronvolt}, conserved{electronvolt}, temperature{kelvin}, electronic_charge, fermi_level{electronvolt}, workfunction{electronvolt}, workfunction_target{electronvolt}, Grand_canonical_potential{electronvolt}]</properties>
     <trajectory filename="positions" stride="1" format="xyz" cell_units="angstrom">positions{angstrom}</trajectory>
     <checkpoint filename="restart" stride="1" overwrite="True"/>
   </output>
-  <total_steps>100</total_steps>
+
+  <total_steps>10</total_steps>
   <prng>
     <seed>31245</seed>
   </prng>
 
-  <ffsocket name="abacus_lcao" mode="inet" pbc="true">
+  <ffsocket name="abacus_al" mode="inet" pbc="true">
     <address>localhost</address>
-	<port>19001</port>
-	<timeout>20000</timeout>
+    <port>19003</port>
+    <timeout>20000</timeout>
     <consolidate_messages>true</consolidate_messages>
-	<batch_size>1</batch_size>
+    <batch_size>1</batch_size>
   </ffsocket>
 
   <system>
@@ -23,29 +24,34 @@
       <cell mode="manual" units="angstrom">[9.9204, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 8.5913]</cell>
       <velocities mode="thermal" units="kelvin">300.0</velocities>
     </initialize>
-    <forces><force forcefield="abacus_lcao"/></forces>
-    <ensemble><temperature units="kelvin">300.0</temperature></ensemble>
+
+    <forces>
+      <force forcefield="abacus_al"/>
+    </forces>
+    <ensemble>
+      <temperature units="kelvin">300.0</temperature>
+    </ensemble>
     <motion mode="dynamics">
       <fixcom>false</fixcom>
       <fixatoms>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]</fixatoms>
       <dynamics mode="nvt" splitting="baoab">
         <timestep units="femtosecond">0.5</timestep>
-        <thermostat mode="svr"><tau units="femtosecond">200.0</tau></thermostat>
-		
+        <thermostat mode="svr">
+          <tau units="femtosecond">200.0</tau>
+        </thermostat>
+
         <electrons enabled="true">
           <target_workfunction units="electronvolt">4.0</target_workfunction>
           <potential_average_axis>y</potential_average_axis>
           <potential_average_region units="angstrom">[12.5, 15.0]</potential_average_region>
           <neutral_electrons>108</neutral_electrons>
-          <q_init>108.0</q_init>
-          <mass units="atomic_unit">400.0</mass>
-          <solvation_update_stride>5</solvation_update_stride>
+          <q_init>107.5</q_init>
+          <mass units="atomic_unit">200.0</mass>
           <potentiostat mode="svr">
             <tau units="femtosecond">200.0</tau>
             <temp units="kelvin">300.0</temp>
           </potentiostat>
         </electrons>
-		
       </dynamics>
     </motion>
   </system>
