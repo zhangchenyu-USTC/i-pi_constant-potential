@@ -15,6 +15,6 @@ alternatives; do not apply them on top of one another.
 neither implicit-solvent input nor an i-PI `<electrons>` section. Update the
 pseudopotential and executable paths before submitting the job.
 
-The standard driver respects an explicit `cal_stress=0` for fixed-cell runs.
+Both drivers respect an explicit `cal_stress=0` for fixed-cell runs.
 Variable-cell requests require `cal_stress=1` and otherwise terminate with an
 error, because i-PI needs a physical virial for pressure-driven dynamics.
