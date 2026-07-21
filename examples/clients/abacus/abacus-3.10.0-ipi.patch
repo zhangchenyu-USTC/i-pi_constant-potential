@@ -47,7 +47,7 @@ index 8084106..3077159 100644
      {
          Relax_Driver rl_driver;
 diff --git a/source/module_io/read_input_item_system.cpp b/source/module_io/read_input_item_system.cpp
-index 58839c7..32ffac3 100644
+index 58839c7..af0f9ad 100644
 --- a/source/module_io/read_input_item_system.cpp
 +++ b/source/module_io/read_input_item_system.cpp
 @@ -62,7 +62,7 @@ void ReadInput::item_system()
@@ -76,18 +76,7 @@ index 58839c7..32ffac3 100644
              {
                  para.input.symmetry = "0";
              }
-@@ -194,6 +195,10 @@ void ReadInput::item_system()
-                     para.input.cal_stress = true;
-                 }
-             }
-+            else if (para.input.calculation == "driver")
-+            {
-+                para.input.cal_stress = true;
-+            }
-             else if (para.input.calculation == "cell-relax")
-             {
-                 para.input.cal_stress = true;
-@@ -206,7 +211,7 @@ void ReadInput::item_system()
+@@ -206,7 +207,7 @@ void ReadInput::item_system()
          Input_Item item("cal_force");
          item.annotation = "if calculate the force at the end of the electronic iteration";
          item.reset_value = [](const Input_Item& item, Parameter& para) {
@@ -96,7 +85,7 @@ index 58839c7..32ffac3 100644
              std::vector<std::string> not_use_force = {"get_wf", "get_pchg", "get_S"};
              if (std::find(use_force.begin(), use_force.end(), para.input.calculation) != use_force.end())
              {
-@@ -228,6 +233,36 @@ void ReadInput::item_system()
+@@ -228,6 +229,36 @@ void ReadInput::item_system()
          read_sync_bool(input.cal_force);
          this->add_item(item);
      }
@@ -133,7 +122,7 @@ index 58839c7..32ffac3 100644
      {
          Input_Item item("kpar");
          item.annotation = "devide all processors into kpar groups and k points "
-@@ -575,7 +610,8 @@ void ReadInput::item_system()
+@@ -575,7 +606,8 @@ void ReadInput::item_system()
          item.annotation = "atomic; first-order; second-order; dm:coefficients of SIA";
          read_sync_string(input.chg_extrap);
          item.reset_value = [](const Input_Item& item, Parameter& para) {
@@ -143,7 +132,7 @@ index 58839c7..32ffac3 100644
              {
                  para.input.chg_extrap = "second-order";
              }
-@@ -791,4 +827,4 @@ void ReadInput::item_system()
+@@ -791,4 +823,4 @@ void ReadInput::item_system()
      }
  }
  
@@ -168,10 +157,10 @@ index 0000000..c844c4f
 +endif()
 diff --git a/source/module_ipi/ipi_driver.cpp b/source/module_ipi/ipi_driver.cpp
 new file mode 100644
-index 0000000..20519f7
+index 0000000..65efb33
 --- /dev/null
 +++ b/source/module_ipi/ipi_driver.cpp
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,481 @@
 +#include "ipi_driver.h"
 +
 +#include "module_base/global_file.h"
@@ -192,7 +181,8 @@ index 0000000..20519f7
 +namespace
 +{
 +const int ROOT_RANK = 0;
-+const double CELL_TOL = 1.0e-10;
++// Bohr; allows for input rounding when the same cell is expressed in Angstrom.
++const double CELL_TOL = 1.0e-5;
 +const std::int32_t MAX_INIT_BYTES = 1024 * 1024;
 +
 +bool is_root()
@@ -498,7 +488,9 @@ index 0000000..20519f7
 +        for (int j = 0; j < 3; ++j)
 +        {
 +            const double old_value = ucell.lat0 * cell_component(ucell.latvec, i, j);
-+            const double new_value = cell_h[3 * i + j];
++            // i-PI stores lattice vectors in columns, while ABACUS stores
++            // them in rows. Transpose the wire-format cell on input.
++            const double new_value = cell_h[3 * j + i];
 +            if (std::abs(old_value - new_value) > CELL_TOL)
 +            {
 +                changed = true;
@@ -511,11 +503,17 @@ index 0000000..20519f7
 +        return;
 +    }
 +
++    if (!PARAM.inp.cal_stress)
++    {
++        ModuleBase::WARNING_QUIT("IPIDriver::update_cell",
++                                 "variable-cell POSDATA requires cal_stress = 1");
++    }
++
 +    for (int i = 0; i < 3; ++i)
 +    {
 +        for (int j = 0; j < 3; ++j)
 +        {
-+            set_cell_component(ucell.latvec, i, j, cell_h[3 * i + j] / ucell.lat0);
++            set_cell_component(ucell.latvec, i, j, cell_h[3 * j + i] / ucell.lat0);
 +        }
 +    }
 +
