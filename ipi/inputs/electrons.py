@@ -21,6 +21,9 @@ __all__ = ["InputElectrons", "InputPotentiostat"]
 
 
 class InputPotentiostat(Input):
+    checkpoint_fields = ("ethermo",)
+    checkpoint_fields_enabled = False
+
     attribs = {
         "mode": (
             InputAttribute,
@@ -48,7 +51,11 @@ class InputPotentiostat(Input):
                 "dtype": float,
                 "default": float("nan"),
                 "dimension": "temperature",
-                "help": "Electronic temperature; defaults to the physical system temperature.",
+                "help": (
+                    "Electronic temperature; when omitted, follows the current "
+                    "physical system temperature. An explicit value, including "
+                    "zero, is independent of the system temperature."
+                ),
             },
         ),
         "ethermo": (
@@ -182,7 +189,6 @@ class InputElectrons(Input):
             InputPotentiostat,
             {"default": input_default(factory=InputPotentiostat)},
         ),
-        "solvation_update_stride": (InputValue, {"dtype": int, "default": 1}),
         "charge_mixing_span": (InputValue, {"dtype": int, "default": 1}),
         "charge_mixing_low": (
             InputValue,
@@ -203,6 +209,8 @@ class InputElectrons(Input):
         "workfunction_average_steps": (InputValue, {"dtype": int, "default": 50}),
         # Complete restart state. Compatibility with 3.1.x restart files is not required.
         "runtime_step": (InputValue, {"dtype": int, "default": 0}),
+        "feedback_initialized": (InputValue, {"dtype": bool, "default": False}),
+        "accepted_frame_id": (InputValue, {"dtype": int, "default": -1}),
         "current_fermi_level": (
             InputValue,
             {"dtype": float, "default": 0.0, "dimension": "energy"},
@@ -230,8 +238,24 @@ class InputElectrons(Input):
         ),
     }
     dynamic = {}
+    runtime_fields = (
+        "runtime_step",
+        "feedback_initialized",
+        "accepted_frame_id",
+        "current_fermi_level",
+        "current_workfunction",
+        "workfunction_average",
+        "workfunction_history",
+        "workfunction_total_samples",
+        "protocol_work",
+    )
+    checkpoint_fields = ("q_init", "p_init", "potentiostat") + runtime_fields
     default_help = "Electronic coordinate and potentiostat for constant-potential MD."
     default_label = "ELECTRONS"
+
+    @property
+    def checkpoint_fields_enabled(self):
+        return bool(self.enabled.value)
 
     _simple_fields = (
         "target_fermi_level",
@@ -246,12 +270,13 @@ class InputElectrons(Input):
         "neutral_electrons",
         "mass",
         "potential_average_axis",
-        "solvation_update_stride",
         "charge_mixing_span",
         "charge_mixing_low",
         "charge_mixing_high",
         "workfunction_average_steps",
         "runtime_step",
+        "feedback_initialized",
+        "accepted_frame_id",
         "current_fermi_level",
         "current_workfunction",
         "workfunction_average",
@@ -292,9 +317,12 @@ class InputElectrons(Input):
         if not isinstance(config, dict) or state is None:
             return
         self.store(config)
+        self.potentiostat.checkpoint_fields_enabled = True
         self.q_init.store(state.q)
         self.p_init.store(state.p)
         self.runtime_step.store(state.current_step)
+        self.feedback_initialized.store(state.feedback_initialized)
+        self.accepted_frame_id.store(state.accepted_frame_id)
         self.current_fermi_level.store(state.current_ef)
         self.current_workfunction.store(state.current_workfunction)
         self.workfunction_average.store(state.current_workfunction_steps_average)
@@ -321,6 +349,15 @@ class InputElectrons(Input):
         }
         for name in self._simple_fields:
             config[name] = getattr(self, name).fetch()
+        # InputSimulation distinguishes new initial conditions from complete
+        # checkpoint state. Explicit zero/default tags also count as runtime data.
+        config["_runtime_fields_present"] = tuple(
+            name for name in self.runtime_fields if getattr(self, name)._explicit
+        )
+        config["_checkpoint_fields_present"] = tuple(
+            name for name in self.checkpoint_fields if getattr(self, name)._explicit
+        )
+        config["_ethermo_present"] = self.potentiostat.ethermo._explicit
         if config["enabled"]:
             self._validate_enabled(config)
         return config
@@ -336,8 +373,6 @@ class InputElectrons(Input):
             raise ValueError("neutral_electrons must be a positive integer.")
         if config["charge_mixing_span"] not in (1, 2):
             raise ValueError("charge_mixing_span must be 1 or 2.")
-        if config["solvation_update_stride"] <= 0:
-            raise ValueError("solvation_update_stride must be a positive integer.")
         if config["workfunction_average_steps"] <= 0:
             raise ValueError("workfunction_average_steps must be positive.")
         if config["charge_mixing"] and config["Ne_doping"]:
@@ -465,6 +500,8 @@ class InputElectrons(Input):
         )
 
         step = int(config["runtime_step"])
+        initialized = bool(config.get("feedback_initialized", False))
+        frame = int(config.get("accepted_frame_id", -1))
         samples = int(config["workfunction_total_samples"])
         history = np.asarray(config["workfunction_history"], float).reshape(-1)
         values = np.asarray(
@@ -477,6 +514,7 @@ class InputElectrons(Input):
         )
         if (
             step < 0
+            or frame < -1
             or samples < 0
             or not np.all(np.isfinite(values))
             or not np.all(np.isfinite(history))
@@ -500,6 +538,8 @@ class InputElectrons(Input):
             )
 
         state.current_step = step
+        state.feedback_initialized = initialized
+        state.accepted_frame_id = frame
         if state.is_linear_mode:
             state.update_target_fermi_level(step, account_work=False)
         state.protocol_work = float(config["protocol_work"])
@@ -509,3 +549,53 @@ class InputElectrons(Input):
         state._workfunction_average_history = history.tolist()
         state._workfunction_average_total_samples = samples
         return state
+
+    @staticmethod
+    def validate_checkpoint(config, next_step):
+        """Reject incomplete or impossible complete-boundary restart states."""
+
+        missing = set(InputElectrons.checkpoint_fields) - set(
+            config.get("_checkpoint_fields_present", ())
+        )
+        if missing or not config.get("_ethermo_present", False):
+            if not config.get("_ethermo_present", False):
+                missing.add("potentiostat/ethermo")
+            raise ValueError(
+                "checkpoint_v1 requires complete electronic lifecycle state; missing "
+                + ", ".join(sorted(missing))
+            )
+        initialized = bool(config["feedback_initialized"])
+        frame = int(config["accepted_frame_id"])
+        scan_step = int(config["runtime_step"])
+        samples = int(config["workfunction_total_samples"])
+        history = np.asarray(config["workfunction_history"], float).reshape(-1)
+        if not initialized:
+            if (
+                next_step != 0
+                or frame != -1
+                or scan_step != 0
+                or samples
+                or history.size
+            ):
+                raise ValueError(
+                    "Uninitialized electronic feedback is only valid before frame 0."
+                )
+            return
+        if frame != next_step or scan_step != max(next_step - 1, 0):
+            raise ValueError(
+                "Electronic checkpoint frame/scan indices do not match its boundary."
+            )
+        if config["Ne_doping"] and config["mode"] == "workfunction":
+            if (
+                samples != frame + 1
+                or not history.size
+                or not np.isclose(
+                    history[-1],
+                    config["current_workfunction"],
+                    rtol=1.0e-12,
+                    atol=1.0e-14,
+                )
+            ):
+                raise ValueError(
+                    "Electronic checkpoint window must end at its accepted frame."
+                )

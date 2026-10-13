@@ -159,6 +159,7 @@ class Simulation:
         threads=False,
         safe_stride=1,
         sockets_prefix="ipi_",
+        state_format="auto",
     ):
         """Initialises Simulation class.
 
@@ -183,6 +184,7 @@ class Simulation:
         self.threading = threads
         self.safe_stride = safe_stride
         self.sockets_prefix = sockets_prefix
+        self.state_format = state_format
 
         self.syslist = syslist
         for s in syslist:
@@ -245,6 +247,10 @@ class Simulation:
         for s in self.syslist:
             # binds important computation engines
             s.bind(self)
+
+        from ipi.engine.constant_potential import validate_constant_potential_ownership
+
+        validate_constant_potential_ownership(self)
 
         if read_only:  # returns before we open the sockets
             return
@@ -324,6 +330,34 @@ class Simulation:
         self.chk.write(store=False)
 
     def run(self, write_outputs=True):
+        """Run and propagate evaluation failures after shared cleanup."""
+        from ipi.engine.forcefields import notify_forcefield_failure
+
+        try:
+            self._run(write_outputs)
+        except Exception as exc:
+            # Covers failures raised by preparation, an integration future,
+            # or output. Cleanup errors must not replace the original cause.
+            try:
+                notify_forcefield_failure(str(exc))
+            finally:
+                raise exc
+        finally:
+            failures = [
+                f._failure
+                for f in self.fflist.values()
+                if getattr(f, "_failure", None) is not None
+            ]
+            if failures:
+                failure = min(failures, key=lambda f: f.time)
+                # A background cleanup can make run_step skip Future.result().
+                # The saved failure is still fatal to the caller and the CLI.
+                try:
+                    notify_forcefield_failure(failure.message)
+                finally:
+                    failure.reraise()
+
+    def _run(self, write_outputs=True):
         """Runs the simulation.
 
         Does all the simulation steps, and outputs data to the appropriate files
@@ -331,10 +365,13 @@ class Simulation:
         in the communication between the driver and the PIMD code.
         """
 
+        # Physical feedback preparation is independent of the output switch and
+        # also re-evaluates a checkpoint's complete saved boundary.
+        self._initialize_constant_potential_observables()
+        self._update_constant_potential_forcefields()
+
         # prints inital configuration -- only if we are not restarting
         if self.step == 0 and write_outputs:
-            self._initialize_constant_potential_observables()
-            self._update_constant_potential_forcefields()
             self.step = -1
             # must use multi-threading to avoid blocking in multi-system runs with WTE
             if self.threading:
@@ -470,18 +507,13 @@ class Simulation:
         self._update_constant_potential_forcefields()
 
     def _initialize_constant_potential_observables(self):
-        """Compute one real step-zero force result before any electronic kick."""
+        """Prepare the current complete electronic boundary before propagation."""
 
-        for index, system in enumerate(self.syslist):
+        for system in self.syslist:
             motion = system.motion
             if getattr(motion, "electronic_state", None) is None:
                 continue
-            motion._sync_electronic_charge(taint=False)
-            # Synchronize normal modes before reading extras. This lets the same
-            # force result serve initial output and the first atomic/electronic B step.
-            _ = system.ensemble.econs
-            fermi = motion._get_fermi_level_from_forces()
-            motion._cache_fermi_level(f"step0:{index}", fermi)
+            motion._prepare_electronic_boundary(self.step)
 
     def _update_constant_potential_forcefields(self):
         """Run strict post-processing only for active electronic forcefields."""

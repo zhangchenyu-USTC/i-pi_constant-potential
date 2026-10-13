@@ -12,6 +12,7 @@ calculation.
 
 import os
 import socket
+from contextlib import nullcontext
 import select
 import time
 import threading
@@ -59,6 +60,15 @@ MESSAGE = {
         "chgdata",
     ]
 }
+
+
+def _restore_full_forces(forces, active, ncoords):
+    """Scatter wire-order forces back into the full system coordinate order."""
+    if len(active) == ncoords and np.array_equal(active, np.arange(ncoords)):
+        return forces
+    full_forces = np.zeros(ncoords, dtype=np.float64)
+    full_forces[active] = forces
+    return full_forces
 
 
 class Disconnected(Exception):
@@ -437,8 +447,8 @@ class Driver(DriverSocket):
         mode_flags = int(mode_flags)
         if not np.isfinite(nelect) or nelect <= 0.0:
             raise ValueError("CHGDATA electron number must be finite and positive.")
-        if mode_flags < 0 or mode_flags > 3:
-            raise ValueError("CHGDATA mode_flags must be a bitmask in [0, 3].")
+        if mode_flags not in (0, 2):
+            raise ValueError("CHGDATA mode_flags must be 0 or 2; bit 0 is reserved.")
         self.sendall(
             MESSAGE["chgdata"]
             + np.float64(nelect).tobytes()
@@ -538,11 +548,9 @@ class Driver(DriverSocket):
 
         r["t_dispatched"] = time.time()
         self.get_status()
-        just_initialized = False
         if self.status & Status.NeedsInit:
             self.initialize(r["id"], r["pars"])
             self.status = self.get_status()
-            just_initialized = True
 
         if not (self.status & Status.Ready):
             warning(
@@ -552,9 +560,7 @@ class Driver(DriverSocket):
             return
 
         if "nelect" in r:
-            # A newly connected or restarted driver cannot own a solvent cache.
-            # Force bit 0 on its first CHGDATA irrespective of the restored MD step.
-            mode_flags = int(r["mode_flags"]) | (1 if just_initialized else 0)
+            mode_flags = int(r["mode_flags"])
             self.sendchg(r["nelect"], mode_flags)
 
         r["start"] = time.time()
@@ -579,11 +585,9 @@ class Driver(DriverSocket):
         if len(r["result"][1]) != len(r["pos"][r["active"]]):
             raise InvalidSize
 
-        # If only a piece of the system is active, resize forces and reassign
-        if len(r["active"]) != len(r["pos"]):
-            rftemp = r["result"][1]
-            r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
-            r["result"][1][r["active"]] = rftemp
+        r["result"][1] = _restore_full_forces(
+            r["result"][1], r["active"], len(r["pos"])
+        )
         r["t_finished"] = time.time()
         self.lastreq = r["id"]
 
@@ -616,11 +620,9 @@ class Driver(DriverSocket):
 
         if not (self.status & Status.Ready):
             self.get_status()
-        just_initialized = False
         if self.status & Status.NeedsInit:
             self.initialize(r["id"], r["pars"])
             self.status = self.get_status()
-            just_initialized = True
 
         if not (self.status & Status.Ready):
             warning(
@@ -632,17 +634,17 @@ class Driver(DriverSocket):
         r["start"] = time.time()
         pos = r["pos"][r["active"]]
         h_ih = r["cell"]
+        if "nelect" in r and int(r["mode_flags"]) not in (0, 2):
+            raise ValueError("CHGDATA mode_flags must be 0 or 2; bit 0 is reserved.")
         try:
             charge_payload = b""
             if "nelect" in r:
                 nelect = float(r["nelect"])
-                mode_flags = int(r["mode_flags"]) | (1 if just_initialized else 0)
+                mode_flags = int(r["mode_flags"])
                 if not np.isfinite(nelect) or nelect <= 0.0:
                     raise ValueError(
                         "CHGDATA electron number must be finite and positive."
                     )
-                if mode_flags < 0 or mode_flags > 3:
-                    raise ValueError("CHGDATA mode_flags must be in [0, 3].")
                 charge_payload = (
                     MESSAGE["chgdata"]
                     + np.float64(nelect).tobytes()
@@ -695,11 +697,9 @@ class Driver(DriverSocket):
 
         r["result"][0] -= r["offset"]
 
-        # If only a piece of the system is active, resize forces and reassign
-        if len(r["active"]) != len(r["pos"]):
-            rftemp = r["result"][1]
-            r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
-            r["result"][1][r["active"]] = rftemp
+        r["result"][1] = _restore_full_forces(
+            r["result"][1], r["active"], len(r["pos"])
+        )
         r["t_finished"] = time.time()
         self.lastreq = r["id"]
 
@@ -889,11 +889,7 @@ class Driver(DriverSocket):
 
         for r, res in zip(reqs, results):
             res[0] -= r["offset"]
-            # if only a piece of the system is active, resize forces and reassign
-            if len(r["active"]) != len(r["pos"]):
-                rftemp = res[1]
-                res[1] = np.zeros(len(r["pos"]), dtype=np.float64)
-                res[1][r["active"]] = rftemp
+            res[1] = _restore_full_forces(res[1], r["active"], len(r["pos"]))
             r["result"] = res
             r["t_finished"] = time.time()
             r["status"] = "Done"
@@ -1442,14 +1438,14 @@ class InterfaceSocket(object):
                 self.clients.remove(c)
                 # requeue jobs that have been left hanging
                 for [k, j, tc] in self.jobs[:]:
-                    tc.result()
                     if j is c:
+                        if tc is not None:
+                            tc.result()
                         self.jobs = [
                             w for w in self.jobs if not (w[0] is k and w[1] is j)
                         ]  # removes pair in a robust way
 
-                        k["status"] = "Queued"
-                        k["start"] = -1
+                        self._requeue_disconnected(k, c)
 
         if len(self.clients) == 0:
             searchtimeout = SERVERTIMEOUT
@@ -1712,8 +1708,11 @@ class InterfaceSocket(object):
         a list of requests (batched job).
         """
         for rr in r if isinstance(r, list) else [r]:
-            rr["status"] = "Queued"
-            rr["start"] = -1
+            with getattr(rr, "_dispatch_lock", nullcontext()):
+                rr["status"] = "Exit" if rr.get("cancelled", False) else "Queued"
+                rr["start"] = -1
+                if rr.get("cancelled", False) and hasattr(rr, "_event_done"):
+                    rr._event_done.set()
         c.status = Status.Disconnected
         self.poll_iter = UPDATEFREQ
 
@@ -1743,6 +1742,9 @@ class InterfaceSocket(object):
             return self._dispatch_free_client_batch(fc)
 
         for r in self.prlist[:]:
+            if r.get("cancelled", False):
+                self.prlist.remove(r)
+                continue
             if match_ids == "match" and fc.lastreq is not r["id"]:
                 continue
             elif match_ids == "none" and fc.lastreq is not None:
@@ -1766,7 +1768,11 @@ class InterfaceSocket(object):
                 self.offset
             )  # transmits with the request an offset value for the energy (typically zero)
 
-            r["status"] = "Running"
+            with getattr(r, "_dispatch_lock", nullcontext()):
+                if r.get("cancelled", False):
+                    self.prlist.remove(r)
+                    continue
+                r["status"] = "Running"
             self.prlist.remove(r)
             if verbosity.high:
                 info(
@@ -1853,6 +1859,7 @@ class InterfaceSocket(object):
                 pass
             c.close()
             c.status = Status.Disconnected
-            return 0  # client will be cleared and request resuscitated in poll_update
+            self._requeue_disconnected(r, c)
+            return 0
 
         return -1

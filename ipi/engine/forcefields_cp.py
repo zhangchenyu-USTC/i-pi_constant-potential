@@ -1,14 +1,17 @@
 """Two-socket integer-electron interpolation for constant-potential MD."""
 
 import time
+import threading
 
 import numpy as np
 
-from ipi.engine.constant_potential import finite_values, mean_extra
+from ipi.engine.constant_potential import (
+    electronic_request_context,
+    validate_request_result,
+    read_constant_potential_feedback,
+)
 from ipi.engine.forcefields import ForceField, ForceRequest
 from ipi.utils.depend import dstrip
-from ipi.utils.softexit import softexit
-from ipi.utils.units import Constants
 
 __all__ = ["FFChargeMixTwoSockets"]
 
@@ -83,9 +86,21 @@ class FFChargeMixTwoSockets(ForceField):
         self.endpoint_low.set_electronic_state(float(low))
         self.endpoint_high.set_electronic_state(float(high))
 
-    def queue(self, atoms, cell, reqid=-1, template=None):
-        if self.current_nelect is None:
-            raise RuntimeError("Charge mixing was queued before q was synchronized.")
+    def queue(self, atoms, cell, reqid=-1, template=None, request_context=None):
+        if self._failure is not None:
+            self._failure.reraise()
+        snapshot = request_context or electronic_request_context(self)
+        # Both endpoint evaluations must use the same geometry as well as q.
+        atoms = atoms.clone()
+        cell = cell.clone()
+        span = self.charge_mixing_span
+        q_low = span * int(np.floor(snapshot.nelect / float(span)))
+        q_high = q_low + span
+        if q_low <= 0:
+            raise ValueError(
+                "Charge-mixing endpoint electron numbers must be positive."
+            )
+        fraction = (snapshot.nelect - q_low) / float(span)
         pbcpos = dstrip(atoms.q).copy()
         if self.iactive is None:
             if self.active[0] == -1:
@@ -99,8 +114,19 @@ class FFChargeMixTwoSockets(ForceField):
         if self.dopbc:
             cell.array_pbc(pbcpos)
 
-        child_low = self.endpoint_low.queue(atoms, cell, reqid=reqid)
-        child_high = self.endpoint_high.queue(atoms, cell, reqid=reqid)
+        # Validate both endpoints before either becomes visible to a worker.
+        child_low = self.endpoint_low._build_request(
+            atoms,
+            cell,
+            reqid=reqid,
+            request_context=snapshot.at_charge(q_low, mode_flags=0),
+        )
+        child_high = self.endpoint_high._build_request(
+            atoms,
+            cell,
+            reqid=reqid,
+            request_context=snapshot.at_charge(q_high, mode_flags=0),
+        )
         fields = {
             "id": reqid,
             "pos": pbcpos,
@@ -115,17 +141,27 @@ class FFChargeMixTwoSockets(ForceField):
             "t_finished": 0,
             "child_low": child_low,
             "child_high": child_high,
-            "lambda": self.lambda_val,
-            "q_current": self.current_nelect,
-            "q_low": self.q_low,
-            "q_high": self.q_high,
+            "lambda": fraction,
+            "q_current": snapshot.nelect,
+            "q_low": q_low,
+            "q_high": q_high,
+            "electronic_context": snapshot,
         }
         if template is not None:
             template.update(fields)
             fields = template
         request = ForceRequest(fields)
-        with self._threadlock:
-            self.requests.append(request)
+        try:
+            self.endpoint_low._publish_request(child_low)
+            self.endpoint_high._publish_request(child_high)
+        except BaseException:
+            self.endpoint_low.cancel_request(child_low)
+            self.endpoint_high.cancel_request(child_high)
+            raise
+        self._publish_request(request)
+        if request["status"] == "Exit":
+            self.endpoint_low.cancel_request(child_low)
+            self.endpoint_high.cancel_request(child_high)
         return request
 
     def poll(self):
@@ -142,8 +178,10 @@ class FFChargeMixTwoSockets(ForceField):
             ):
                 self._fail(
                     request,
-                    f"Charge-mixing endpoint failed: low={low['status']}, "
-                    f"high={high['status']}.",
+                    RuntimeError(
+                        f"Charge-mixing endpoint failed: low={low['status']}, "
+                        f"high={high['status']}."
+                    ),
                 )
                 continue
             if low["status"] == "Done" and high["status"] == "Done":
@@ -152,36 +190,43 @@ class FFChargeMixTwoSockets(ForceField):
                         low["result"], high["result"], request
                     )
                 except Exception as exc:
-                    self._fail(request, str(exc))
+                    self._fail(request, exc)
                     continue
                 request["status"] = "Done"
                 request["t_finished"] = time.time()
                 request._event_done.set()
 
-    @staticmethod
-    def _fail(request, message):
-        request["status"] = "Exit"
-        request["error"] = message
-        request["t_finished"] = time.time()
-        request._event_done.set()
-        softexit.trigger(status="bad", message=f"Charge mixing failed: {message}")
+    def _fail(self, request, exception):
+        self.endpoint_low.cancel_request(request.get("child_low"))
+        self.endpoint_high.cancel_request(request.get("child_high"))
+        self.record_failure(exception, request)
+        self._doloop[0] = False
+        if threading.current_thread() is self._thread:
+            self.notify_failure()
 
     def release(self, request, lock=True):
         if request is not None:
-            self.endpoint_low.release(request.get("child_low"))
-            self.endpoint_high.release(request.get("child_high"))
+            for endpoint, key in (
+                (self.endpoint_low, "child_low"),
+                (self.endpoint_high, "child_high"),
+            ):
+                child = request.get(key)
+                if child is None:
+                    continue
+                if child["status"] in ("Done", "Exit", "Error"):
+                    endpoint.release(child)
+                else:
+                    endpoint.cancel_request(child)
         super().release(request, lock=lock)
 
     @staticmethod
-    def _endpoint_scalar(extras, key, label):
-        values = finite_values(extras, key, f"{label} endpoint extras")
-        if values.size != 1:
-            raise RuntimeError(f"{label} endpoint result contains non-scalar '{key}'.")
-        return float(values[0])
+    def _endpoint_scalar(extras, key):
+        # Complete replies have already passed the shared scalar checks.
+        return float(np.asarray(extras[key]).reshape(-1)[0])
 
     def _mix_results(self, low, high, request):
-        if low is None or high is None or len(low) < 4 or len(high) < 4:
-            raise RuntimeError("Charge-mixing endpoint returned an incomplete result.")
+        validate_request_result(low, request["child_low"])
+        validate_request_result(high, request["child_high"])
         fraction = float(request["lambda"])
         if not np.isfinite(fraction) or fraction < 0.0 or fraction > 1.0:
             raise RuntimeError("Charge-mixing interpolation fraction is invalid.")
@@ -193,39 +238,12 @@ class FFChargeMixTwoSockets(ForceField):
         force_high = np.asarray(high[1], float)
         virial_low = np.asarray(low[2], float)
         virial_high = np.asarray(high[2], float)
-        if (
-            not np.isfinite(energy_low)
-            or not np.isfinite(energy_high)
-            or force_low.ndim != 1
-            or force_low.shape != force_high.shape
-            or (
-                "active" in request
-                and force_low.size != np.asarray(request["active"]).size
-            )
-            or virial_low.shape != (3, 3)
-            or virial_low.shape != virial_high.shape
-            or not np.all(np.isfinite(force_low))
-            or not np.all(np.isfinite(force_high))
-            or not np.all(np.isfinite(virial_low))
-            or not np.all(np.isfinite(virial_high))
-        ):
-            raise RuntimeError(
-                "Charge-mixing endpoint energy, force, or virial is invalid."
-            )
-
         extras_low = low[3]
         extras_high = high[3]
-        nelect_low = self._endpoint_scalar(extras_low, "nelect", "low")
-        nelect_high = self._endpoint_scalar(extras_high, "nelect", "high")
-        if (
-            abs(nelect_low - request["q_low"]) > 1.0e-8
-            or abs(nelect_high - request["q_high"]) > 1.0e-8
-        ):
-            raise RuntimeError(
-                "Charge-mixing endpoint electron number disagrees with CHGDATA."
-            )
-        fermi_low = self._endpoint_scalar(extras_low, "fermi_level_eV", "low")
-        fermi_high = self._endpoint_scalar(extras_high, "fermi_level_eV", "high")
+        nelect_low = self._endpoint_scalar(extras_low, "nelect")
+        nelect_high = self._endpoint_scalar(extras_high, "nelect")
+        fermi_low = self._endpoint_scalar(extras_low, "fermi_level_eV")
+        fermi_high = self._endpoint_scalar(extras_high, "fermi_level_eV")
         extras = {
             "raw": "",
             "fermi_level_eV": wlow * fermi_low + whigh * fermi_high,
@@ -238,10 +256,10 @@ class FFChargeMixTwoSockets(ForceField):
             "endpoint_low_energy": energy_low,
             "endpoint_high_energy": energy_high,
         }
-        state = self._dynamics_ref.electronic_state
-        if state.mode == "workfunction":
-            wf_low = self._endpoint_scalar(extras_low, "workfunction_eV", "low")
-            wf_high = self._endpoint_scalar(extras_high, "workfunction_eV", "high")
+        mode = request["electronic_context"].mode
+        if mode == "workfunction":
+            wf_low = self._endpoint_scalar(extras_low, "workfunction_eV")
+            wf_high = self._endpoint_scalar(extras_high, "workfunction_eV")
             extras["workfunction_eV"] = wlow * wf_low + whigh * wf_high
             extras["endpoint_low_workfunction_eV"] = wf_low
             extras["endpoint_high_workfunction_eV"] = wf_high
@@ -251,25 +269,11 @@ class FFChargeMixTwoSockets(ForceField):
             wlow * virial_low + whigh * virial_high,
             extras,
         ]
-        if (
-            not np.isfinite(mixed[0])
-            or not np.all(np.isfinite(mixed[1]))
-            or not np.all(np.isfinite(mixed[2]))
-        ):
-            raise RuntimeError("Charge-mixing produced non-finite force data.")
+        validate_request_result(mixed, request)
         return mixed
 
     def update(self):
         super().update()
         if self._dynamics_ref is None:
             raise RuntimeError("Charge-mixing wrapper is not bound to Dynamics.")
-        extras = self._dynamics_ref.forces.extras
-        returned = finite_values(extras, "nelect", "mixed force extras")
-        if np.any(np.abs(returned - self.current_nelect) > 1.0e-8):
-            raise RuntimeError("Mixed electron number is inconsistent with q.")
-        fermi = mean_extra(extras, "fermi_level_eV", "mixed force extras")
-        self._dynamics_ref._cache_fermi_level("charge_mixing", fermi)
-        if self._dynamics_ref.electronic_state.mode == "workfunction":
-            workfunction = mean_extra(extras, "workfunction_eV", "mixed force extras")
-            extras["workfunction_eV_mean"] = workfunction
-            extras["workfunction_mean"] = workfunction / Constants.EV_PER_HARTREE
+        read_constant_potential_feedback(self._dynamics_ref)

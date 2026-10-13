@@ -73,6 +73,10 @@ class ElectronicState:
             raise ValueError(f"Unsupported electronic control mode '{self.mode}'.")
 
         self.current_step = 0
+        # Feedback is accepted at complete configuration boundaries. The target
+        # scan index above is separate from this frame index (including frame 0).
+        self.feedback_initialized = False
+        self.accepted_frame_id = -1
         self.current_ef = 0.0
         self.current_workfunction = 0.0
         self.current_workfunction_steps_average = 0.0
@@ -392,31 +396,34 @@ class PotentiostatLangevin(Potentiostat):
 
 
 class PotentiostatSVR(Potentiostat):
-    """Stochastic velocity rescaling for one electronic degree of freedom."""
+    """One-dimensional SVR, with tau the kinetic-energy relaxation time."""
 
     def O_step(self, dt):
+        dt = _finite(dt, "Potentiostat timestep")
+        if dt < 0.0:
+            raise ValueError("Potentiostat timestep must be non-negative.")
         if self.electronic_state.freeze_electronic_dynamics:
             return
-        dt = _finite(dt, "Potentiostat timestep")
-        c = np.exp(-dt / float(self.tau))
-        kinetic = self.electronic_state.kinetic_energy
-        target = 0.5 * Constants.kb * float(self.temp)
-        random_normal = self.prng.gvec(1)[0]
-        if kinetic <= 0.0:
-            sigma = np.sqrt(self.electronic_state.mass * Constants.kb * self.temp)
-            self.electronic_state.p = sigma * random_normal
-            self.ethermo += kinetic - self.electronic_state.kinetic_energy
+        if dt == 0.0:
             return
-        ratio = target / kinetic
-        alpha2 = (
-            c
-            + (1.0 - c) * ratio * random_normal**2
-            + 2.0 * random_normal * np.sqrt(c * (1.0 - c) * ratio)
+
+        # The signed one-dimensional SVR update is algebraically equivalent
+        # to rescaling at nonzero momentum, but remains well defined at zero
+        # and avoids division by an arbitrarily small kinetic energy.  Keep
+        # the original Gaussian sign convention for each sign of momentum.
+        relaxation = dt / float(self.tau)
+        decay = np.exp(-0.5 * relaxation)
+        sigma = np.sqrt(
+            self.electronic_state.mass
+            * Constants.kb
+            * float(self.temp)
+            * (-np.expm1(-relaxation))
         )
-        alpha = np.sqrt(max(alpha2, 1.0e-14))
-        if np.sqrt(c) + random_normal * np.sqrt((1.0 - c) * ratio) < 0.0:
-            alpha = -alpha
-        self.electronic_state.p *= alpha
+        momentum = self.electronic_state.p
+        kinetic = self.electronic_state.kinetic_energy
+        random_normal = self.prng.gvec(1)[0]
+        sign = -1.0 if momentum < 0.0 else 1.0
+        self.electronic_state.p = decay * momentum + sign * sigma * random_normal
         self.ethermo += kinetic - self.electronic_state.kinetic_energy
 
     def step(self, dt=None):

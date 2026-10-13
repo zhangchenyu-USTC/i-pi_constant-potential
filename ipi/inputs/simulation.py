@@ -12,6 +12,7 @@ from ipi.utils.units import *
 from ipi.utils.prng import *
 from ipi.utils.io import *
 from ipi.utils.io.inputs.io_xml import *
+from ipi.utils.io.inputs.serialization import checkpoint_serialization
 from ipi.utils.messages import verbosity
 from ipi.engine.smotion import Smotion
 from ipi.inputs.prng import InputRandom
@@ -96,6 +97,15 @@ class InputSimulation(Input):
     }
 
     attribs = {
+        "state_format": (
+            InputAttribute,
+            {
+                "dtype": str,
+                "default": "auto",
+                "options": ["auto", "initial", "checkpoint_v1"],
+                "help": "Initial conditions or complete constant-potential checkpoint state.",
+            },
+        ),
         "verbosity": (
             InputAttribute,
             {
@@ -225,6 +235,15 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
         self.smotion.store(simul.smotion)
         self.threading.store(simul.threading)
         self.floatformat.store(ipi_global_settings["floatformat"])
+        self._checkpoint_serialization = True
+        self.state_format.store(
+            "checkpoint_v1"
+            if any(
+                getattr(s.motion, "electronic_state", None) is not None
+                for s in simul.syslist
+            )
+            else "auto"
+        )
 
         # this we pick from the messages class. kind of a "global" but it seems to
         # be the best way to pass around the (global) information on the level of output.
@@ -312,6 +331,59 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
             else:
                 self.extra[_ii][1].store(_obj)
 
+    def write(self, name="", indent="", text="\n"):
+        if getattr(self, "_checkpoint_serialization", False):
+            with checkpoint_serialization():
+                return super().write(name, indent, text)
+        return super().write(name, indent, text)
+
+    def _validate_constant_potential_state_format(self, systems):
+        """Reject legacy CP continuation without restricting ordinary fresh XML."""
+
+        from ipi.inputs.electrons import InputElectrons
+
+        state_format = self.state_format.fetch()
+        next_step = int(self.step.fetch())
+        for system in systems:
+            config = getattr(system.motion, "electrons_config", None)
+            if not isinstance(config, dict) or not config.get("enabled", False):
+                continue
+            runtime = config.get("_runtime_fields_present", ())
+            if state_format == "checkpoint_v1":
+                if getattr(system, "_input_has_initialize", False):
+                    raise ValueError(
+                        "checkpoint_v1 must contain the saved inline physical state."
+                    )
+                if not (
+                    getattr(system, "_input_has_full_beads", False)
+                    and getattr(system, "_input_has_cell", False)
+                    and self.prng.state._explicit
+                ):
+                    raise ValueError(
+                        "checkpoint_v1 requires saved beads, cell, and PRNG state."
+                    )
+                InputElectrons.validate_checkpoint(config, next_step)
+                continue
+            if next_step != 0 or runtime:
+                raise ValueError(
+                    "Legacy constant-potential checkpoint cannot continue without "
+                    "checkpoint_v1 lifecycle fields."
+                )
+            legacy_shape = (
+                not getattr(system, "_input_has_initialize", False)
+                and getattr(system, "_input_has_full_beads", False)
+                and getattr(system, "_input_has_cell", False)
+                and self.prng.state._explicit
+            )
+            if state_format == "auto" and (
+                legacy_shape or config.get("_ethermo_present", False)
+            ):
+                raise ValueError(
+                    "Unmarked constant-potential checkpoint or ambiguous inline initial state; "
+                    "legacy continuation is rejected. Use state_format='initial' only for "
+                    "new initial conditions without electronic runtime fields."
+                )
+
     def fetch(self):
         """Creates a simulation object.
 
@@ -369,6 +441,8 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
                     new_ff.socket.sockets_prefix = self.sockets_prefix.fetch()
                 fflist.append(new_ff)
 
+        self._validate_constant_potential_state_format(syslist)
+
         # this creates a simulation object which gathers all the little bits
         import ipi.engine.simulation as esimulation  # import here as otherwise this is the mother of all circular imports...
 
@@ -385,6 +459,7 @@ frequency in your simulation to make i-PI faster. Use at your own risk!
             threads=self.threading.fetch(),
             safe_stride=self.safe_stride.fetch(),
             sockets_prefix=self.sockets_prefix.fetch(),
+            state_format=self.state_format.fetch(),
         )
 
         return rsim

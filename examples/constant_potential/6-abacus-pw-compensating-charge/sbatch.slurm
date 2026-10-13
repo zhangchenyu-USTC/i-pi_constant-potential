@@ -13,6 +13,8 @@ i-pi input.xml > ipi.log 2>&1 &
 
 sleep 5
 
+export ABACUS_SOCKET_ADDRESS=localhost:19003
+
 mpirun -np 36 /path/to/abacus > abacus.log 2>&1
 
 wait

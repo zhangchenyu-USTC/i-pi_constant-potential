@@ -1,7 +1,8 @@
 INPUT_PARAMETERS
 pseudo_dir          /path/to/pseudo_dir
 nbands              80
-calculation         driver
+calculation         scf
+socket_driver       1
 symmetry            0
 
 basis_type          pw
@@ -37,7 +38,3 @@ block               1
 block_down          0.4
 block_up            0.5
 block_height        0.10
-
-ipi_mode            inet
-ipi_host            localhost
-ipi_port            19003

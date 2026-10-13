@@ -59,7 +59,7 @@ def _client(mode, address, port):
     )
 
 
-def _exchange_one_force(mode, consolidate=True, batch_size=1):
+def _exchange_one_force(mode, consolidate=True, batch_size=1, active=None, natoms=2):
     """Round-trips a single force evaluation through the chosen transport."""
     address = (
         "localhost"
@@ -75,7 +75,13 @@ def _exchange_one_force(mode, consolidate=True, batch_size=1):
         consolidate_messages=consolidate,
         batch_size=batch_size,
     )
-    ff = FFSocket(latency=1e-4, name="ut", interface=iface, dopbc=False)
+    ff = FFSocket(
+        latency=1e-4,
+        name="ut",
+        interface=iface,
+        dopbc=False,
+        active=np.array([-1] if active is None else active),
+    )
 
     # open (bind+listen) and fork the driver before the poll thread exists, so
     # the fork happens single-threaded; the client connection waits in the
@@ -86,8 +92,8 @@ def _exchange_one_force(mode, consolidate=True, batch_size=1):
     client.start()
     ForceField.start(ff)
     try:
-        atoms = Atoms(2)
-        atoms.q[:] = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+        atoms = Atoms(natoms)
+        atoms.q[:] = np.arange(3 * natoms, dtype=float) * 0.1
         cell = Cell(np.eye(3) * 10.0)
         req = ff.queue(atoms, cell, reqid=0)
 
@@ -133,3 +139,30 @@ def test_unix_threaded_dispatch():
     # consolidate_messages=False exercises the per-request worker-thread path
     pot, force, q = _exchange_one_force("unix", consolidate=False)
     assert np.allclose(force, -K * q)
+
+
+@fork_only
+@pytest.mark.parametrize(
+    "consolidate,batch_size",
+    [(False, 1), (True, 1), (True, 4)],
+    ids=["threaded", "consolidated", "batched"],
+)
+@pytest.mark.parametrize(
+    "active,natoms",
+    [([-1], 3), ([1], 2), ([2, 0], 3), ([1, 0], 2)],
+    ids=["all", "subset", "permuted-subset", "full-permutation"],
+)
+def test_active_force_mapping(consolidate, batch_size, active, natoms):
+    pot, force, q = _exchange_one_force(
+        "unix",
+        consolidate=consolidate,
+        batch_size=batch_size,
+        active=active,
+        natoms=natoms,
+    )
+    selected = np.arange(natoms) if active == [-1] else np.array(active)
+    positions = q.reshape(natoms, 3)
+    expected = np.zeros_like(positions)
+    expected[selected] = -K * positions[selected]
+    np.testing.assert_allclose(force, expected.reshape(-1), rtol=0, atol=1e-15)
+    assert pot == pytest.approx(0.5 * K * np.sum(positions[selected] ** 2))

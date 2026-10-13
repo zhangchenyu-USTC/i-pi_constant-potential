@@ -227,4 +227,12 @@ class InputSystem(Input):
             prefix=self.prefix.fetch(),
         )
 
+        # Preserve input provenance before Initializer/Simulation materialize it.
+        # This distinguishes ordinary initial conditions from legacy checkpoints.
+        rsys._input_has_initialize = self.initialize._explicit
+        rsys._input_has_full_beads = self.beads._explicit and all(
+            getattr(self.beads, name)._explicit for name in ("q", "p", "m", "names")
+        )
+        rsys._input_has_cell = self.cell._explicit
+
         return rsys

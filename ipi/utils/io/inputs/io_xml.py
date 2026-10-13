@@ -13,6 +13,7 @@ from xml.sax.handler import ContentHandler
 import numpy as np
 from ipi import ipi_global_settings
 from . import read_value
+from .serialization import float_format
 
 __all__ = [
     "xml_node",
@@ -578,7 +579,7 @@ def write_float(data):
         A formatted string.
     """
 
-    return ipi_global_settings["floatformat"] % data
+    return (float_format.get() or ipi_global_settings["floatformat"]) % data
 
 
 def write_bool(data):

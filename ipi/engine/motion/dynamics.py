@@ -20,7 +20,11 @@ from ipi.engine.thermostats import Thermostat
 from ipi.engine.barostats import Barostat, BaroRGB
 from ipi.utils.messages import warning, verbosity
 from ipi.utils.units import Constants
-from ipi.engine.constant_potential import finite_values
+from ipi.engine.constant_potential import (
+    bind_constant_potential_provider,
+    read_constant_potential_feedback,
+    validate_constant_potential_weights,
+)
 
 
 class Dynamics(Motion):
@@ -130,7 +134,9 @@ class Dynamics(Motion):
         self._electronic_econs = None
         self._fermi_cache = {}
         self._fermi_cache_valid = False
-        self._constant_potential_force_step = 0
+        self._electronic_boundary_needs_refresh = True
+        self._electronic_boundary_state = None
+        self._electronic_step_frame = None
 
     def get_fixdof(self):
         """Calculate the number of fixed degrees of freedom, required for
@@ -271,7 +277,8 @@ class Dynamics(Motion):
         if self.potentiostat is None:
             raise ValueError("Constant-potential dynamics requires a potentiostat.")
         temperature = float(config.get("potentiostat_temp", float("nan")))
-        if math.isnan(temperature):
+        inherit_temperature = math.isnan(temperature)
+        if inherit_temperature:
             # q is one system-wide electronic coordinate. Its force is the
             # bead-averaged chemical potential, so it samples at the physical
             # temperature T, not at the P*T ring-polymer bead temperature.
@@ -280,7 +287,10 @@ class Dynamics(Motion):
             raise ValueError(
                 "The electronic temperature must be supplied for this ensemble."
             )
-        self.potentiostat.temp = temperature
+        if inherit_temperature:
+            dpipe(self.ensemble._temp, self.potentiostat._temp)
+        else:
+            self.potentiostat.temp = temperature
         dpipe(self._dt, self.potentiostat._dt)
         self.potentiostat.bind(self.electronic_state, prng)
         self._electronic_econs = depend_value(
@@ -326,12 +336,11 @@ class Dynamics(Motion):
                 "The constant-potential force component cannot use ring-polymer contraction."
             )
 
-        self._constant_potential_force_step = self.electronic_state.current_step
-        if self.electronic_state.current_step > 0:
-            self._cache_fermi_level(
-                "restart",
-                self.electronic_state.current_ef * Constants.EV_PER_HARTREE,
-            )
+        bind_constant_potential_provider(self, provider_components[0], providers[0])
+        # A newly bound backend must evaluate the complete saved boundary before
+        # propagation. Its transient force/solvent caches are not checkpoint state.
+        self._clear_fermi_cache()
+        self._electronic_boundary_needs_refresh = True
         self._sync_electronic_charge(taint=False)
 
     def get_electronic_econs(self):
@@ -361,12 +370,120 @@ class Dynamics(Motion):
     def _begin_electronic_step(self, step):
         if self.electronic_state is None:
             return False
-        current = int(self.electronic_state.current_step if step is None else step)
+        current = int(
+            max(self.electronic_state.accepted_frame_id, 0) if step is None else step
+        )
         if current < 0:
             raise ValueError("Constant-potential simulation step cannot be negative.")
+        self._prepare_electronic_boundary(current)
+        self._electronic_step_frame = current
         self.electronic_state.update_target_fermi_level(current)
-        self._constant_potential_force_step = current
         return True
+
+    def _accept_electronic_feedback(self, frame_id, fermi_eV, workfunction_eV):
+        """Accept one physical frame, or replace a re-evaluation of that frame."""
+
+        state = self.electronic_state
+        frame_id = int(frame_id)
+        fermi_eV = float(fermi_eV)
+        if not np.isfinite(fermi_eV) or frame_id < 0:
+            raise RuntimeError(
+                "Electronic boundary feedback must be finite and nonnegative."
+            )
+        workfunction = None
+        if state.mode == "workfunction":
+            if workfunction_eV is None or not np.isfinite(float(workfunction_eV)):
+                raise RuntimeError(
+                    "Electronic boundary requires a finite workfunction."
+                )
+            workfunction = float(workfunction_eV) / Constants.EV_PER_HARTREE
+        previous = state.accepted_frame_id
+        if not state.feedback_initialized:
+            if (
+                frame_id != 0
+                or previous != -1
+                or state._workfunction_average_total_samples
+            ):
+                raise RuntimeError(
+                    "Uninitialized electronic feedback must start at frame 0."
+                )
+            same_frame = False
+        else:
+            if frame_id not in (previous, previous + 1):
+                raise RuntimeError("Electronic feedback frames must be consecutive.")
+            same_frame = frame_id == previous
+
+        history = list(state._workfunction_average_history)
+        samples = state._workfunction_average_total_samples
+        average = workfunction
+        if state.use_workfunction_average:
+            if same_frame:
+                if not history or samples != frame_id + 1:
+                    raise RuntimeError(
+                        "Electronic window does not contain its accepted frame."
+                    )
+                history[-1] = workfunction
+            else:
+                history.append(workfunction)
+                history = history[-state.workfunction_average_steps :]
+                samples += 1
+            average = float(np.mean(history))
+
+        # Commit only after all provider data and lifecycle conditions pass.
+        self._cache_fermi_level(f"frame:{frame_id}", fermi_eV)
+        if workfunction is not None:
+            state.current_workfunction = workfunction
+            state.current_workfunction_steps_average = average
+        state._workfunction_average_history = history
+        state._workfunction_average_total_samples = samples
+        state.feedback_initialized = True
+        state.accepted_frame_id = frame_id
+        self._electronic_boundary_state = (
+            np.array(self.beads.q, copy=True),
+            np.array(self.cell.h, copy=True),
+            state.q,
+        )
+        self._electronic_boundary_needs_refresh = False
+        return fermi_eV
+
+    def _prepare_electronic_boundary(self, frame_id):
+        """Prepare complete-boundary forces independently of output and step entry."""
+
+        if self.electronic_state is None:
+            return
+        validate_constant_potential_weights(self)
+        state = self.electronic_state
+        frame_id = int(frame_id)
+        if state.feedback_initialized and state.accepted_frame_id != frame_id:
+            raise RuntimeError(
+                "Electronic accepted frame does not match the integration boundary."
+            )
+        snapshot = self._electronic_boundary_state
+        unchanged = snapshot is not None and (
+            np.array_equal(snapshot[0], self.beads.q)
+            and np.array_equal(snapshot[1], self.cell.h)
+            and snapshot[2] == state.q
+        )
+        if (
+            not self._electronic_boundary_needs_refresh
+            and unchanged
+            and self._fermi_cache_valid
+        ):
+            return
+        self._sync_electronic_charge(taint=False)
+        if self._electronic_boundary_needs_refresh or not unchanged:
+            # A reload/reconnect or explicit change at this frame needs a fresh
+            # complete force packet, not a persisted electronic scalar alone.
+            for component in self.forces.mforces:
+                for force_bead in component._forces:
+                    force_bead._ufvx.taint()
+        # Synchronize normal modes and all nuclear force components before any
+        # nuclear/cell drift, preserving the original beginning-B force packet.
+        _ = self.ensemble.econs
+        _ = self.forces.f
+        _ = self.forces.vir
+        fermi, workfunction = read_constant_potential_feedback(self)
+        self._accept_electronic_feedback(frame_id, fermi, workfunction)
 
     def _sync_electronic_charge(self, taint=False):
         if self.electronic_state is None:
@@ -390,32 +507,9 @@ class Dynamics(Motion):
             self._clear_fermi_cache()
 
     def _get_fermi_level_from_forces(self):
-        extras = self.forces.extras
-        context = "constant-potential force extras"
-        returned = finite_values(extras, "nelect", context)
-        fermi_values = finite_values(extras, "fermi_level_eV", context)
-        if returned.size != self.beads.nbeads or fermi_values.size != self.beads.nbeads:
-            raise RuntimeError(
-                "Constant-potential extras must contain one scalar nelect and "
-                "fermi_level_eV per full-system bead."
-            )
-        if np.any(np.abs(returned - self.electronic_state.q) > 1.0e-8):
-            raise RuntimeError(
-                "Force extras report an electron number inconsistent with q."
-            )
-        fermi = float(np.mean(fermi_values))
-        if self.electronic_state.mode == "workfunction":
-            workfunction_values = finite_values(extras, "workfunction_eV", context)
-            if workfunction_values.size != self.beads.nbeads:
-                raise RuntimeError(
-                    "Constant-potential extras must contain one scalar "
-                    "workfunction_eV per full-system bead."
-                )
-            workfunction = float(np.mean(workfunction_values))
-            self.electronic_state.record_workfunction_sample(
-                workfunction / Constants.EV_PER_HARTREE
-            )
-        return fermi
+        """Read provider feedback without changing its sampling history."""
+
+        return read_constant_potential_feedback(self)[0]
 
     def step(self, step=None):
         """Advances the dynamics by one time step"""
@@ -549,8 +643,15 @@ class DummyIntegrator:
         if self.electronic_state is None:
             return
         self.dynamics._sync_electronic_charge(taint=False)
-        if refresh or not self.dynamics._fermi_cache_valid:
-            fermi = self.dynamics._get_fermi_level_from_forces()
+        if refresh:
+            fermi, workfunction = read_constant_potential_feedback(self.dynamics)
+            fermi = self.dynamics._accept_electronic_feedback(
+                self.dynamics._electronic_step_frame + 1, fermi, workfunction
+            )
+        elif not self.dynamics._fermi_cache_valid:
+            raise RuntimeError(
+                "Electronic beginning-B requires prepared boundary feedback."
+            )
         else:
             fermi = next(iter(self.dynamics._fermi_cache.values()))
         self.dynamics._cache_fermi_level("electronic_B", fermi)
@@ -561,14 +662,7 @@ class DummyIntegrator:
             return
         previous = self.electronic_state.q
         self.potentiostat.A(dt)
-        changed = abs(self.electronic_state.q - previous) > 1.0e-14
-        # Forces requested after the electronic drift belong to the next
-        # integer-time configuration. This keeps solvent refreshes at
-        # configurations 0, stride, 2*stride, ... rather than refreshing both
-        # the initial and end-of-step force under the same step number.
-        self.dynamics._constant_potential_force_step = (
-            int(self.electronic_state.current_step) + 1
-        )
+        changed = self.electronic_state.q != previous
         self.dynamics._sync_electronic_charge(taint=changed)
 
     def pconstraints(self):

@@ -21,6 +21,11 @@ bad data types, and failure to input required fields.
 from copy import copy
 
 import numpy as np
+from ipi.utils.io.inputs.serialization import (
+    checkpoint_mode,
+    default_serialization,
+    float_format,
+)
 
 from ipi.utils.io.inputs.io_xml import *
 from ipi.utils.units import unit_to_internal, unit_to_user
@@ -190,8 +195,12 @@ class Input(object):
 
         # stores what we would write out if the default was set
         self._defwrite = ""
+        self._checkpoint_defwrite = ""
         if self._default is not None:
-            self._defwrite = self.write(name="%%NAME%%")
+            with default_serialization():
+                self._defwrite = self.write(name="%%NAME%%")
+            with default_serialization(precise=True):
+                self._checkpoint_defwrite = self.write(name="%%NAME%%")
 
     def set_default(self):
         """Sets the default value of the object."""
@@ -275,19 +284,32 @@ class Input(object):
             # have a very simple way to check whether they actually add something:
             # we compare with the string that would be output if the argument was set
             # to its default
-            defstr = self.__dict__[a]._defwrite.replace("%%NAME%%", a)
+            default = (
+                self.__dict__[a]._checkpoint_defwrite
+                if float_format.get()
+                else self.__dict__[a]._defwrite
+            )
+            defstr = default.replace("%%NAME%%", a)
             outstr = self.__dict__[a].write(name=a)
             if outstr != defstr:
-                rstr += " " + outstr
+                rstr += " " + self.__dict__[a].write(name=a)
         rstr += ">"
         rstr += text
         for f in self.instancefields:
             # only write out fields that are not defaults
 
-            defstr = self.__dict__[f]._defwrite.replace("%%NAME%%", f)
-            if defstr != self.__dict__[f].write(
-                f
-            ):  # here we must compute the write string twice not to be confused by indents.
+            default = (
+                self.__dict__[f]._checkpoint_defwrite
+                if float_format.get()
+                else self.__dict__[f]._defwrite
+            )
+            defstr = default.replace("%%NAME%%", f)
+            force_write = (
+                checkpoint_mode.get()
+                and getattr(self, "checkpoint_fields_enabled", True)
+                and f in getattr(self, "checkpoint_fields", ())
+            )
+            if force_write or defstr != self.__dict__[f].write(f):
                 rstr += self.__dict__[f].write(f, "   " + indent)
 
         for f, v in self.extra:

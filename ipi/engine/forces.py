@@ -25,6 +25,10 @@ from ipi.utils.depend import *
 from ipi.utils.nmtransform import nm_rescale
 from ipi.engine.beads import Beads
 from ipi.engine.cell import Cell
+from ipi.engine.constant_potential import (
+    electronic_request_context,
+    validate_request_result,
+)
 
 __all__ = ["Forces", "ForceComponent"]
 
@@ -74,6 +78,13 @@ class ForceBead:
         self._threadlock = threading.Lock()
         self.request = None
         self._getallcount = 0
+        self._electronic_owner = None
+        self._electronic_purpose = "production"
+
+    def bind_electronic_context(self, dynamics, purpose="production"):
+        self._electronic_owner = dynamics
+        self._electronic_purpose = purpose
+        self._ufvx.add_dependency(dynamics.electronic_state._q)
 
     def bind(self, atoms, cell, ff, output_maker):
         """Binds atoms, cell and a forcefield template to the ForceBead object.
@@ -137,7 +148,20 @@ class ForceBead:
         with self._threadlock:
             is_tainted = self._ufvx.tainted()
             if self.request is None and is_tainted:
-                self.request = self.ff.queue(self.atoms, self.cell, reqid=self.uid)
+                if self._electronic_owner is None:
+                    self.request = self.ff.queue(self.atoms, self.cell, reqid=self.uid)
+                else:
+                    owner = self._electronic_owner
+                    context = electronic_request_context(
+                        self.ff,
+                        dynamics=owner,
+                        q=owner.electronic_state.q,
+                        bead_id=self.uid,
+                        purpose=self._electronic_purpose,
+                    )
+                    self.request = self.ff.queue(
+                        self.atoms, self.cell, reqid=self.uid, request_context=context
+                    )
         return is_tainted
 
     def get_all(self):
@@ -152,60 +176,56 @@ class ForceBead:
            A list of the form [potential, force, virial, extra].
         """
 
-        # because we thread over many systems and outputs, we might get called
-        # more than once. keep track of how many times we are called so we
-        # can make sure to wait until the last call has returned before we release
+        # A single request can have several consumers (for example an output
+        # and an integrator). Every exit path must return its reservation.
         with self._threadlock:
             self._getallcount += 1
+        request = None
+        failure = None
+        result = None
+        try:
+            if self.request is None:
+                self.queue()
+            request = self.request
+            latency = self.ff.latency
+            while request["status"] != "Done":
+                if "exception" in request:
+                    raise RuntimeError(request["error"]) from request["exception"]
+                if request["status"] == "Exit" or softexit.triggered:
+                    softexit.trigger(
+                        message=" @ FORCES : cannot return so will die off here"
+                    )
+                    while softexit.exiting:
+                        time.sleep(latency)
+                    sys.exit()
+                request._event_done.wait(timeout=1.0)
 
-        # this is converting the distribution library requests into [ u, f, v ]  lists
-        if self.request is None:
-            self.queue()
+            info(
+                " @forces: FF %s evaluated in %f (queue) and %f (dispatched) sec."
+                % (
+                    self.ff.name,
+                    request["t_finished"] - request["t_queued"],
+                    request["t_finished"] - request["t_dispatched"],
+                ),
+                verbosity.debug,
+            )
+            result = request["result"]
+            validate_request_result(result, request)
+        except Exception as exc:
+            failure = self.ff.record_failure(exc, request)
+        finally:
+            with self._threadlock:
+                self._getallcount -= 1
+                last_consumer = self._getallcount == 0
+                if last_consumer and self.request is request:
+                    self.request = None
+            if last_consumer and request is not None:
+                self.ff.release(request)
 
-        # sleeps until the request has been evaluated
-        request = self.request
-        latency = self.ff.latency
-        while request["status"] != "Done":
-            if request["status"] == "Exit" or softexit.triggered:
-                # now, this is tricky. we are stuck here and we cannot return meaningful results.
-                # if we return, we may as well output wrong numbers, or mess up things.
-                # so we can only call soft-exit and wait until that is done. then kill the thread
-                # we are in.
-                softexit.trigger(
-                    message=" @ FORCES : cannot return so will die off here"
-                )
-                while softexit.exiting:
-                    time.sleep(latency)
-                sys.exit()
-            request._event_done.wait(timeout=1.0)
-
-        # print diagnostics about the elapsed time
-        info(
-            " @forces: FF %s evaluated in %f (queue) and %f (dispatched) sec."
-            % (
-                self.ff.name,
-                request["t_finished"] - request["t_queued"],
-                request["t_finished"] - request["t_dispatched"],
-            ),
-            verbosity.debug,
-        )
-
-        # data has been collected, so the request can be released and a slot
-        # freed up for new calculations
-        result = request["result"]
-
-        # reduce the reservation count (and wait for all calls to return)
-        with self._threadlock:
-            self._getallcount -= 1
-
-        # releases just once, but wait for all requests to be complete
-        if self._getallcount == 0:
-            self.ff.release(request)
-            self.request = None
-        else:
-            while self._getallcount > 0:
-                time.sleep(latency)
-
+        if failure is not None:
+            # No request/ForceBead lock is held while cleanup joins workers.
+            self.ff.notify_failure()
+            failure.reraise()
         return result
 
     def get_pot(self):
@@ -1029,6 +1049,12 @@ class Forces:
         nforce.bind(
             nbeads, ncell, self.fcomp, self.ff, self.open_paths, self.output_maker
         )
+        for original, cloned in zip(self.mforces, nforce.mforces):
+            owner = getattr(original, "_electronic_owner", None)
+            if owner is not None:
+                cloned._electronic_owner = owner
+                for bead in cloned._forces:
+                    bead.bind_electronic_context(owner, purpose="auxiliary")
         return nforce
 
     def dump_state(self):

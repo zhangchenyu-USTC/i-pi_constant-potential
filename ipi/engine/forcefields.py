@@ -14,6 +14,7 @@ import threading
 import json
 import sys
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -26,8 +27,9 @@ from ipi.interfaces.mpi import InterfaceMPI
 from ipi.interfaces.utils import parse_extra
 from ipi.engine.constant_potential import (
     ConstantPotentialSocketMixin,
-    finite_values,
-    mean_extra,
+    electronic_request_context,
+    validate_request_result,
+    read_constant_potential_feedback,
 )
 from ipi.utils.depend import dstrip
 from ipi.utils.io import read_file
@@ -43,6 +45,35 @@ from ipi.utils.mathtools import (
 plumed = None
 
 
+@dataclass(frozen=True)
+class ForceFieldFailure:
+    """The first evaluation failure, retained after requests are released."""
+
+    exception: Exception
+    message: str
+    time: float
+
+    def reraise(self):
+        raise RuntimeError(self.message) from self.exception
+
+
+_failure_cleanup_lock = threading.Lock()
+
+
+def notify_forcefield_failure(message):
+    """Run cleanup once, without making polling threads join one another."""
+    # The main thread may wait for an ongoing cleanup. A worker must instead
+    # finish: the cleanup owner can already be joining that worker.
+    wait = threading.current_thread() is threading.main_thread()
+    if not _failure_cleanup_lock.acquire(blocking=wait):
+        return
+    try:
+        if not softexit.triggered:
+            softexit.cleanup(status="bad", message=message)
+    finally:
+        _failure_cleanup_lock.release()
+
+
 class ForceRequest(dict):
     """An extension of the standard Python dict class which only has a == b
     if a is b == True, rather than if the elements of a and b are identical.
@@ -55,6 +86,7 @@ class ForceRequest(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._event_done = threading.Event()
+        self._dispatch_lock = threading.Lock()
 
     def __eq__(self, y):
         """Overwrites the standard equals function."""
@@ -125,6 +157,8 @@ class ForceField:
         self._thread = None
         self._doloop = [False]
         self._threadlock = threading.Lock()
+        self._failure = None
+        self._failure_lock = threading.Lock()
 
     def bind(self, output_maker=None):
         """Binds the FF, at present just to allow for
@@ -132,7 +166,13 @@ class ForceField:
 
         self.output_maker = output_maker
 
-    def queue(self, atoms, cell, reqid=-1, template=None):
+    def queue(self, atoms, cell, reqid=-1, template=None, request_context=None):
+        request = self._build_request(atoms, cell, reqid, template, request_context)
+        return self._publish_request(request)
+
+    def _build_request(
+        self, atoms, cell, reqid=-1, template=None, request_context=None
+    ):
         """Adds a request.
 
         Note that the pars dictionary need to be sent as a string of a
@@ -204,19 +244,79 @@ class ForceField:
             "t_dispatched": 0,
             "t_finished": 0,
         }
-        if template is None:
-            newreq = ForceRequest(fields)
-        else:
+        if template is not None:
             template.update(fields)
-            newreq = ForceRequest(template)
+            fields = dict(template)
+        fields = self._prepare_request(fields, request_context)
+        newreq = ForceRequest(fields)
+        return newreq
 
+    def _publish_request(self, newreq):
         with self._threadlock:
+            if self._failure is not None:
+                self._finish_failed_request(newreq, self._failure)
+                return newreq
             self.requests.append(newreq)
 
         if not self.threaded:
             self.poll()
 
         return newreq
+
+    @staticmethod
+    def _finish_failed_request(request, failure):
+        request["result"] = None
+        request["error"] = failure.message
+        request["exception"] = failure.exception
+        request["t_finished"] = time.time()
+        request["status"] = "Exit"
+        request._event_done.set()
+
+    def record_failure(self, exception, request=None):
+        """Record a failure without callbacks or acquiring the polling lock."""
+        with self._failure_lock:
+            if self._failure is None:
+                context = f"Forcefield '{self.name}'"
+                if request is not None:
+                    context += f" request {request['id']}"
+                    snapshot = request.get("electronic_context")
+                    if snapshot is not None:
+                        context += (
+                            f" (bead={snapshot.bead_id}, q={snapshot.nelect:.17g})"
+                        )
+                self._failure = ForceFieldFailure(
+                    exception, f"{context} failed: {exception}", time.monotonic()
+                )
+            failure = self._failure
+        if request is not None:
+            self._finish_failed_request(request, failure)
+        return failure
+
+    def notify_failure(self):
+        if self._failure is not None:
+            notify_forcefield_failure(self._failure.message)
+
+    def cancel_request(self, request):
+        """Cancel queued work; keep in-flight work tracked until its reply drains."""
+        if request is None:
+            return
+        with request._dispatch_lock:
+            with self._threadlock:
+                request["cancelled"] = True
+                if request["status"] == "Queued":
+                    request["status"] = "Exit"
+                    request._event_done.set()
+                if (
+                    request["status"] in ("Done", "Exit", "Error")
+                    and request in self.requests
+                ):
+                    self.requests.remove(request)
+
+    def _prepare_request(self, fields, request_context):
+        """Finish request inputs before they become visible to any consumer."""
+        if request_context is not None:
+            fields["electronic_context"] = request_context
+        return fields
 
     def poll(self):
         """Polls the forcefield object to check if it has finished."""
@@ -279,8 +379,12 @@ class ForceField:
         """Dummy stop method."""
 
         self._doloop[0] = False
-        for r in self.requests:
-            r["status"] = "Exit"
+        with self._threadlock:
+            for r in self.requests:
+                if r["status"] not in ("Done", "Exit", "Error"):
+                    r["status"] = "Exit"
+                    r["t_finished"] = time.time()
+                r._event_done.set()
 
     def start(self):
         """Spawns a new thread.
@@ -370,6 +474,15 @@ class FFSocket(ConstantPotentialSocketMixin, ForceField):
         """Function to check the status of the client calculations."""
 
         self.socket.poll()
+        with self._threadlock:
+            self.requests[:] = [
+                r
+                for r in self.requests
+                if not (
+                    r.get("cancelled", False)
+                    and r["status"] in ("Done", "Exit", "Error")
+                )
+            ]
 
     def start(self):
         """Spawns a new thread."""
@@ -386,7 +499,7 @@ class FFSocket(ConstantPotentialSocketMixin, ForceField):
         """Closes the socket and the thread."""
 
         super(FFSocket, self).stop()
-        if self._thread is not None:
+        if self._thread is not None and self._thread is not threading.current_thread():
             # must wait until loop has ended before closing the socket
             self._thread.join()
         self.socket.close()
@@ -567,54 +680,64 @@ class FFDirect(ForceField):
         # We have to be thread-safe, as in multi-system mode this might get
         # called by many threads at once.
         # This is slightly different than for FFEval because of the batched evaluation
+        failed = False
         with self._threadlock:
-            new_requests = False
-            for r in self.requests:
-                if r["status"] == "Queued":
-                    r["status"] = "Running"
-                    r["t_dispatched"] = time.time()
-                    self.evaluate(r)
-                    new_requests = True
+            if self._failure is not None:
+                return
+            current = None
+            try:
+                new_requests = False
+                for r in self.requests:
+                    if r["status"] == "Queued":
+                        current = r
+                        r["status"] = "Running"
+                        r["t_dispatched"] = time.time()
+                        self.evaluate(r)
+                        new_requests = True
 
-            # for batched evaluation, flush incomplete batches
-            # if the poll loop has been idle for a few cycles
-            if self.batch_size > 1 and len(self.request_batch) > 0:
-                if new_requests:
-                    self._batch_idle_cycles = 0
-                else:
-                    self._batch_idle_cycles += 1
-                if self._batch_idle_cycles >= self._batch_idle_threshold:
-                    self.launch_batch()
+                # Flush incomplete batches after the queue has been idle.
+                if self.batch_size > 1 and self.request_batch:
+                    current = self.request_batch[0]
+                    if new_requests:
+                        self._batch_idle_cycles = 0
+                    else:
+                        self._batch_idle_cycles += 1
+                    if self._batch_idle_cycles >= self._batch_idle_threshold:
+                        self.launch_batch()
+            except Exception as exc:
+                failure = self.record_failure(exc, current)
+                for request in self.requests:
+                    if request["status"] not in ("Done", "Exit", "Error"):
+                        self._finish_failed_request(request, failure)
+                self.request_batch.clear()
+                self._batch_idle_cycles = 0
+                self._doloop[0] = False
+                failed = True
+        # Synchronous callers receive a completed failure request. A polling
+        # worker must also wake systems waiting on other forcefields.
+        if failed and threading.current_thread() is self._thread:
+            self.notify_failure()
 
-    def _process_results(self, results, request):
+    def _prepare_results(self, results, request):
         # ensure shapes, apply the offset and parse the extra string
         results[0] -= self.offset
         results[1] = np.asarray(results[1]).reshape(-1)
         results[2] = np.asarray(results[2]).reshape(3, 3)
         results[3] = parse_extra(results[3])
 
-        if self.charge_enabled:
-            if (
-                not np.isfinite(float(results[0]))
-                or not np.all(np.isfinite(results[1]))
-                or not np.all(np.isfinite(results[2]))
-            ):
-                raise RuntimeError(
-                    "Constant-potential FFDirect returned non-finite force data."
-                )
-            returned = finite_values(results[3], "nelect", "FFDirect extras")
-            if returned.size != 1 or abs(returned[0] - self.current_nelect) > 1.0e-8:
-                raise RuntimeError(
-                    "FFDirect electron number is inconsistent with the requested q."
-                )
-            mean_extra(results[3], "fermi_level_eV", "FFDirect extras")
-            if self._dynamics_ref.electronic_state.mode == "workfunction":
-                mean_extra(results[3], "workfunction_eV", "FFDirect extras")
+        validate_request_result(results, request)
 
+        return results
+
+    @staticmethod
+    def _publish_results(results, request):
         request["result"] = results
+        request["t_finished"] = time.time()
         request["status"] = "Done"
         request._event_done.set()
-        request["t_finished"] = time.time()
+
+    def _process_results(self, results, request):
+        self._publish_results(self._prepare_results(results, request), request)
 
     def launch_batch(self):
         """Dispatches the current batch for evaluation."""
@@ -626,14 +749,27 @@ class FFDirect(ForceField):
         )
         cell_batch = [r["cell"][0] for r in self.request_batch]
         pos_batch = [r["pos"].reshape(-1, 3) for r in self.request_batch]
-        results_batch = self.driver(cell_batch, pos_batch)
-        for results, request in zip(results_batch, self.request_batch):
-            self._process_results(list(results), request)
+        results_batch = list(self.driver(cell_batch, pos_batch))
+        if len(results_batch) != len(self.request_batch):
+            raise RuntimeError(
+                "FFDirect batch returned %d results for %d requests."
+                % (len(results_batch), len(self.request_batch))
+            )
+        prepared = [
+            self._prepare_results(list(results), request)
+            for results, request in zip(results_batch, self.request_batch)
+        ]
+        for results, request in zip(prepared, self.request_batch):
+            self._publish_results(results, request)
         self.request_batch = []
         self._batch_idle_cycles = 0
 
     def evaluate(self, request):
         if self.batch_size == 1:
+            snapshot = request.get("electronic_context")
+            if snapshot is not None:
+                # poll holds the same lock through setting q and evaluating the PES.
+                self.driver.set_electronic_state(snapshot.nelect)
             results = list(
                 self.driver(request["cell"][0], request["pos"].reshape(-1, 3))
             )
@@ -668,6 +804,16 @@ class FFDirect(ForceField):
             )
         self.charge_enabled = True
         self._dynamics_ref = dynamics
+        self.electrons_config = dict(electrons_config)
+
+    def _prepare_request(self, fields, request_context):
+        if self.charge_enabled:
+            request_context = request_context or electronic_request_context(self)
+            if request_context.owner_id != id(self._dynamics_ref):
+                raise RuntimeError(
+                    "FFDirect electronic request belongs to a different Dynamics."
+                )
+        return super()._prepare_request(fields, request_context)
 
     def set_electronic_state(self, q):
         if not self.charge_enabled:
@@ -677,21 +823,13 @@ class FFDirect(ForceField):
             raise ValueError(
                 "FFDirect electronic coordinate must be finite and positive."
             )
-        self.driver.set_electronic_state(value)
         self.current_nelect = value
 
     def update(self):
         super().update()
         if not self.charge_enabled:
             return
-        extras = self._dynamics_ref.forces.extras
-        returned = finite_values(extras, "nelect", "FFDirect force extras")
-        if np.any(np.abs(returned - self.current_nelect) > 1.0e-8):
-            raise RuntimeError("FFDirect force extras are inconsistent with q.")
-        fermi = mean_extra(extras, "fermi_level_eV", "FFDirect force extras")
-        self._dynamics_ref._cache_fermi_level("direct", fermi)
-        if self._dynamics_ref.electronic_state.mode == "workfunction":
-            mean_extra(extras, "workfunction_eV", "FFDirect force extras")
+        read_constant_potential_feedback(self._dynamics_ref)
 
 
 class FFLennardJones(FFEval):
