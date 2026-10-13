@@ -1,175 +1,235 @@
 # A Flexible and Generalized Constant-Potential Framework in i-PI
 
-This project extends [i-PI 3.3.0](https://github.com/i-pi/i-pi) with a shared
-electron-number coordinate and a potentiostat. An electronic-structure client
-computes energy, atomic forces, the Fermi level, and optionally the work
-function; i-PI propagates the nuclei and electron number toward the target
-potential.
+[简体中文](README.zh-CN.md)
 
-The `abacus-develop-validation` branch publishes the **ABACUS PW/LCAO
-constant-potential integration**, its matching i-PI server, and runnable
-examples. Start with the [ABACUS client instructions](examples/clients/abacus/README.md)
-and [examples and verification suite](examples/clients/abacus/validation/README.md).
-The VASP and CP2K release remains on
-[`main`](https://github.com/zhangchenyu-USTC/i-pi_constant-potential/tree/main).
-Its client patches use that release's protocol and are not paired with this
-branch's server.
+This project extends [i-PI 3.3.0](https://github.com/i-pi/i-pi) with constant-potential molecular dynamics.
+It retains i-PI's server–client architecture and adds a system-wide electronic degree of freedom alongside the nuclear degrees of freedom, allowing the electron count to evolve with the target work function during molecular dynamics.
 
-Related publication:
+The implementation supports fractional electron counts, interpolation between two integer endpoints, the Ne counter-electrode method, and constant-potential path-integral molecular dynamics: **all beads share the same electron count, and their mean work function or mean Fermi level drives the electronic degree of freedom.**
 
-> Chenyu Zhang, Ruoting Zhao, Zhengda He, Marcella Iannuzzi, Yanxia Chen, and Jinggang Lan,
-> *A Flexible and Generalized Constant-Potential Framework in i-PI*,
-> Journal of Chemical Theory and Computation (2026),
-> [doi:10.1021/acs.jctc.6c00504](https://doi.org/10.1021/acs.jctc.6c00504).
+The following first-principles clients support constant-potential simulations through i-PI:
 
-## Install and run
+- VASP 5.4.4 + vaspsol++;
+- CP2K 2026.1;
+- ABACUS 3.11.0-beta10 (PW and LCAO).
 
-Install this checkout in a Python environment:
+The constant-potential patches for these clients are located at:
+
+- `examples/clients/vasp/vasp-5.4.4-ipi-constant-potential.patch`
+- `examples/clients/cp2k/cp2k-2026.1-ipi-constant-potential.patch`
+- `examples/clients/abacus/abacus-3.11.0-beta10-pr7939-ipi-constant-potential.patch`
+
+Examples are provided in `examples/constant_potential/`.
+
+Related papers: Chenyu Zhang et al., *A Flexible and Generalized Constant-Potential Framework in i-PI*, Journal of Chemical Theory and Computation (2026), [DOI: 10.1021/acs.jctc.6c00504](https://doi.org/10.1021/acs.jctc.6c00504).
+
+Chenyu Zhang et al., *Electrode Potentials in Computational Electrochemistry: Referencing, Control and Uncertainty*. Current Opinion in Electrochemistry (2026), [DOI: 10.1016/j.coelec.2026.101947](https://doi.org/10.1016/j.coelec.2026.101947).
+
+## Methods and features
+
+The total electron count $q$ serves as a generalized coordinate, with conjugate momentum $p_q$. For each configuration evaluation, the client receives the current $q$, performs an SCF calculation, and returns the actual electron count, Fermi level, and, in work-function mode, the work function.
+
+The electronic driving forces in the two control modes are:
+
+$$
+F_q=\mu_\star-\overline{\mu},
+\qquad
+F_q=\overline{\Phi}-\Phi_\star.
+$$
+
+The star denotes the target value, and the overbar denotes an average over beads. For a single bead, its feedback is used directly. The client computes the work function as $\Phi=V_{\mathrm{ref}}-E_F$, where $V_{\mathrm{ref}}$ is the planar-averaged electrostatic potential over the specified direction and interval. Ne mode also supports a moving average of the work function over accepted physical frames.
+
+Constant-Fermi-level control requires a consistent potential reference; a fixed Fermi level corresponds to a fixed work function when the reference potential remains unchanged.
+
+Electron counts are handled through two approaches:
+
+- **Fractional electron counts**: one client directly evaluates the current real-valued electron count.
+- **Two integer endpoints**: two clients evaluate adjacent integer electron counts. i-PI combines their energies, nuclear forces, virials, Fermi levels, and work functions using the same linear weights. The electronic driving force follows the mixed-feedback definition above.
+
+The electronic thermostat can be Langevin or SVR. When its `temp` is omitted, it continuously follows the physical system temperature $T$; this remains $T$ for multiple beads. Setting `temp` explicitly gives the electronic thermostat an independent temperature.
+
+Constant-potential integration in i-PI supports NVE, NVT, NPT, and NST, with cell and electronic-structure settings supported by the client. Checkpoints save the electronic state, thermostat energy, random-number state, work-function window, and target-scan progress. Inputs without `<electrons>` use the original i-PI simulation workflow.
+
+### Charge compensation
+
+Changing the total electron count in a constant-potential simulation generally gives the electrode's electron–ion subsystem a net charge. Dielectric polarization redistributes bound charge, whose integral over the entire periodic cell is zero; it cannot by itself ensure cell neutrality. The current examples use the following compensation strategies:
+
+- **VASP + vaspsol++**: `2-vasp-implicit` uses `ISOL=2`, `C_MOLAR=1.0`, and
+  `R_ION=4.0`. Mobile ions in the Poisson–Boltzmann continuum produce the compensating charge self-consistently.
+  `C_MOLAR` specifies the bulk electrolyte concentration.
+- **ABACUS**: the PW and LCAO examples use `gate_flag=1`, dipole correction, and a blocking region, without implicit solvent.
+  A planar gate charge compensates the charged electrode; the gate and blocking region must be placed in a suitable region without atoms.
+- **CP2K**: the implicit Poisson model used here provides a dielectric response but does not include a mobile continuum-ion compensation model corresponding to vaspsol++'s
+  `C_MOLAR`/`R_ION`.
+
+The Ne counter-electrode provides another compensation approach. Each configuration evaluation uses the current electron count and the corresponding effective Ne nuclear charge. Numerical stability depends on the electronic generalized mass, potentiostat time constant, SCF convergence, work-function averaging window, and the number and positions of Ne atoms. These settings require convergence tests for the system of interest. Future changes may allow updating the electron count once every few steps.
+
+## Installation
+
+### i-PI
+
+Install with Python 3.10 or later in a dedicated environment:
 
 ```bash
+git clone https://github.com/zhangchenyu-USTC/i-pi_constant-potential.git
+cd i-pi_constant-potential
 python -m pip install -e .
+i-pi --help
 ```
 
-Build ABACUS develop using the
-[constant-potential patch](examples/clients/abacus/abacus-develop-constant-potential.patch).
-Apply it to the clean commit listed in the
-[client README](examples/clients/abacus/README.md), then follow ABACUS's normal
-build instructions. The baseline includes the upstream AO interpolation
-fix #8119. Its PCC contribution is included in both electrostatic cube output
-and the potential used for work-function feedback.
+Alternatively, run `source env.sh` in the project directory to use the source tree directly. Compile the clients with the matching patches below, configuring build and link dependencies according to each program's build instructions.
 
-Run a small example directly on a node:
+### VASP 5.4.4 + VASPsol++
+
+Apply the following to your VASP 5.4.4 source directory, in order:
+
+1. The official `patch.5.4.4.16052018` fix.
+2. The VASPsol++ patch for VASP 5.4.4.
+3. The `solvation_intel.F` file matching this version and compiler, copied to `src/solvation.F`.
+4. This project's [combined VASP patch](examples/clients/vasp/vasp-5.4.4-ipi-constant-potential.patch).
 
 ```bash
-export ABACUS_CP_EXECUTABLE=/path/to/modified/abacus
-export ABACUS_PP_ORB=/path/to/abacus-source/tests/PP_ORB
-cd examples/clients/abacus/validation
-python run_example.py si2-pw --output /path/to/new-run --ranks 4 --steps 3
+cd /path/to/vasp.5.4.4
+patch -p0 < /path/to/patch.5.4.4.16052018
+patch -p1 < /path/to/vaspsol++-vasp_5.4.4.patch
+cp /path/to/solvation_intel.F src/solvation.F
+patch --dry-run -p1 < /path/to/vasp-5.4.4-ipi-constant-potential.patch
+patch -p1 < /path/to/vasp-5.4.4-ipi-constant-potential.patch
 ```
 
-The launcher starts i-PI and ABACUS, waits for both, and stores their outputs
-in the new directory. Use `si2-lcao`, `al36-pw`, or `al36-lcao` for the other
-cases. Slurm is not required. Larger gate-compensated electrode inputs are in
-[`6-abacus-pw-compensating-charge`](examples/constant_potential/6-abacus-pw-compensating-charge/)
-and [`7-abacus-lcao-compensating-charge`](examples/constant_potential/7-abacus-lcao-compensating-charge/).
+The combined patch includes the ordinary i-PI interface. Compile it using the VASP build procedure. Use `IBRION=23` for ordinary socket calculations and `IBRION=24` for constant-potential calculations.
 
-## Electron control and communication
+The new INCAR parameter `SOL_UPDATE` controls the VASPsol update interval. It takes a positive integer and defaults to `1`. For example, `SOL_UPDATE=5` updates the solvent response at local configuration-evaluation indices `0, 5, 10…`. Other evaluations reuse the frozen solvent field while performing electronic SCF at the current electron count and computing the energy, nuclear forces, and work function. A restart or new INIT forces an initial refresh and resets the counter; STATUS and repeated result reads do not advance it. The current setup for `SOL_UPDATE>1` uses a single bead and an independent VASP process for each endpoint. Other VASP modes use the default value `1`.
 
-ABACUS uses a single socket and accepts fractional total electron numbers.
-i-PI sends the current number through `CHGDATA` before each `POSDATA`; ABACUS
-updates occupations and charge-dependent potentials, then performs SCF at that
-number. It returns the converged energy and forces together with extras such as:
+### CP2K 2026.1
 
-```json
-{
-  "fermi_level_eV": -1.2,
-  "nelect": 107.5,
-  "workfunction_eV": 5.0
-}
+Apply the [complete patch](examples/clients/cp2k/cp2k-2026.1-ipi-constant-potential.patch) to a clean CP2K `v2026.1` source tree, then build and install it using CP2K's toolchain or CMake procedure:
+
+```bash
+cd /path/to/cp2k-2026.1
+git apply --check /path/to/cp2k-2026.1-ipi-constant-potential.patch
+git apply /path/to/cp2k-2026.1-ipi-constant-potential.patch
 ```
 
-`nelect` is the actual occupation sum. Both programs check it against the
-request with an absolute tolerance of `1e-8`. The work function is the selected
-electrostatic-potential average minus the current Fermi level. The reference
-potential is evaluated in memory using the same construction as cube output.
+Run the newly installed executable with its matching shared libraries, and set `CP2K_DATA_DIR` to the CP2K data directory. Ne mode requires `CORE_CORR_DIP` and `SURFACE_DIPOLE_CORRECTION`; see [example 5](examples/constant_potential/5-cp2k-Ne/cp2k.inp) for the complete settings.
 
-The ABACUS constant-potential path uses fixed-cell CPU double-precision
-norm-conserving PW/LCAO KSDFT, `calculation=scf`, `socket_driver=1`,
-`cal_force=1`, `cal_stress=0`, and `nspin=1` or `2`. Socket calculations default
-to `symmetry=0`; an explicit `symmetry=-1` is also supported. Connect with
-`ABACUS_SOCKET_ADDRESS=/tmp/ipi_<address>:UNIX` or `host:port`.
+### ABACUS 3.11.0-beta10
 
-`CHGDATA` contains a float64 total electron number and int32 flags. ABACUS
-uses flags `0`. i-PI no longer sends a solvent-update schedule; the removed
-`solvation_update_stride` XML/INIT field and old flags `1`/`3` are rejected.
-Native ABACUS implicit solvation updates through its usual SCF path. The
-supplied electrode examples use the native planar gate, dipole correction,
-and blocking region for compensation, with `imp_sol=0`.
+The patch is based on the original `3.11.0-beta10`, at upstream commit `40e7ce8c575abb2ae7fc0df1bd6ec4b48a695d2d`:
 
-## Configure constant-potential dynamics
+```bash
+git clone https://github.com/deepmodeling/abacus-develop.git
+cd abacus-develop
+git checkout 40e7ce8c575abb2ae7fc0df1bd6ec4b48a695d2d
+git apply --check /path/to/abacus-3.11.0-beta10-pr7939-ipi-constant-potential.patch
+git apply /path/to/abacus-3.11.0-beta10-pr7939-ipi-constant-potential.patch
+```
 
-Place the electronic settings under `<motion><dynamics>`:
+The [patch](examples/clients/abacus/abacus-3.11.0-beta10-pr7939-ipi-constant-potential.patch) extends the native socket driver with electron-count control, actual-occupation checks, and Fermi-level and work-function feedback. The reference potential shares its calculation with the native electrostatic-potential cube output, and charge compensation uses the native gate. Follow the ABACUS documentation to compile; the constant-potential examples use a fixed cell.
+
+## Input and execution
+
+### Start with an analytical potential
+
+[Example 1](examples/constant_potential/1-pes-fermi/) runs without a DFT client and provides a direct check of the installation and electronic dynamics:
+
+```bash
+cp -r examples/constant_potential/1-pes-fermi /path/to/pes-run
+cd /path/to/pes-run
+i-pi input.xml > ipi.log 2>&1
+```
+
+The following is a complete three-step input. Place example 1's `init.xyz` in the same directory to run it:
 
 ```xml
-<electrons enabled="true" charge_mixing="false">
-  <target_workfunction units="electronvolt">4.0</target_workfunction>
-  <potential_average_axis>z</potential_average_axis>
-  <potential_average_region units="angstrom">[2, 4]</potential_average_region>
-  <neutral_electrons>8</neutral_electrons>
-  <q_init>8.05</q_init>
-  <mass units="dalton">50</mass>
-  <potentiostat mode="langevin">
-    <tau units="femtosecond">300</tau>
-  </potentiostat>
-</electrons>
+<simulation verbosity="low">
+  <output prefix="simulation">
+    <properties stride="1" filename="out">[step, time{femtosecond}, potential{electronvolt}, electronic_charge, fermi_level{electronvolt}]</properties>
+    <checkpoint filename="restart" stride="1" overwrite="True"/>
+  </output>
+  <total_steps>3</total_steps>
+  <prng><seed>31245</seed></prng>
+  <ffdirect name="toy_pes">
+    <pes>asym_dw_constant_potential</pes>
+    <parameters>{a:1.0, b:3.0, d:1.0, x0:0.0, c:-10.0, pzc:5.0, cap:10.0, q_default:1.0}</parameters>
+  </ffdirect>
+  <system>
+    <initialize nbeads="1">
+      <cell mode="abc" units="angstrom">[10.0, 10.0, 10.0]</cell>
+      <file mode="xyz" units="angstrom">init.xyz</file>
+      <velocities mode="thermal" units="kelvin">300.0</velocities>
+    </initialize>
+    <forces><force forcefield="toy_pes"/></forces>
+    <ensemble><temperature units="kelvin">300.0</temperature></ensemble>
+    <motion mode="dynamics">
+      <fixatoms_dof>[1, 2]</fixatoms_dof>
+      <dynamics mode="nvt" splitting="baoab">
+        <timestep units="femtosecond">0.5</timestep>
+        <thermostat mode="svr"><tau units="femtosecond">200.0</tau></thermostat>
+        <electrons enabled="true">
+          <target_fermi_level units="electronvolt">-4.5</target_fermi_level>
+          <neutral_electrons>1</neutral_electrons>
+          <q_init>1.0</q_init>
+          <mass units="atomic_unit">200.0</mass>
+          <potentiostat mode="svr"><tau units="femtosecond">200.0</tau></potentiostat>
+        </electrons>
+      </dynamics>
+    </motion>
+  </system>
+</simulation>
 ```
 
-These values follow the small Si2 example. Set the neutral count, starting
-count, target, and reference interval for the chosen structure. Use
-`target_fermi_level` instead of the work-function target and reference window
-for constant-Fermi-level dynamics. The electronic mass is a fictitious
-dynamical parameter.
+### Constant work function and electronic parameters
 
-Langevin and SVR electronic thermostats are available. Omitting
-`potentiostat/temp` makes the electronic temperature follow the physical
-ensemble temperature continuously; an explicit value remains independent.
+Constant-potential settings belong under `<motion><dynamics><electrons>`. For an external DFT client, configure `ffsocket` and the client connection address following the corresponding example. In work-function mode, replace the Fermi-level target with the following target and reference window:
 
-All beads share one electron number and electronic momentum. The electronic
-feedback is the arithmetic mean over bead Fermi levels or work functions.
-Each bead is checked against the same requested electron count before its
-feedback is accepted. The common server also retains integer-endpoint mixing;
-the ABACUS examples use direct fractional-electron SCF.
+```xml
+<target_workfunction units="electronvolt">4.6</target_workfunction>
+<potential_average_axis>z</potential_average_axis>
+<potential_average_region units="angstrom">[12.5, 15.0]</potential_average_region>
+```
 
-Each system has one electronic-feedback force component, covering every bead
-without contraction and with unit effective weight. Other charge-independent
-force components retain their own weights. Each system uses its own
-constant-potential backend and connection pool. Returned forces are restored
-to full atomic order, including for reordered or partial `active` selections.
+Choose a reference window on the electrostatic-potential plateau in the intended vacuum or solvent reference region. When changing the structure, set the direction and interval from its planar-averaged potential profile.
 
-## Requests, trajectories, and restart
+| Parameter | Meaning |
+|---|---|
+| `target_fermi_level` / `target_workfunction` | Select one control target |
+| `neutral_electrons` | Total electron count of the neutral system |
+| `q_init`, `p_init` | Initial total electron count and its generalized momentum |
+| `mass` | Fictitious mass of the electron-count degree of freedom |
+| `potential_average_axis`, `potential_average_region` | Direction and averaging interval for the work-function reference potential |
+| `charge_mixing="true"` | Enable interpolation between two integer endpoints on `<electrons>` |
+| `Ne_doping="true"` | Enable Ne counter-electrode mode on `<electrons>` |
+| `workfunction_average_steps` | Moving-average window for the work function in Ne mode |
+| `potentiostat` | Electronic thermostat type, time constant, and optional temperature |
 
-Electronic metadata, geometry, and cell form one immutable request snapshot
-before the request enters a worker queue. Energy, full nuclear force, virial,
-and electronic feedback are checked together before use. Failed evaluations
-wake waiting consumers and propagate their original error.
+Two-endpoint mode defines two sockets; i-PI calls both and combines their results. See [example 4](examples/constant_potential/4-cp2k-implicit-mixing/input.xml) for the endpoint configuration.
 
-The integrator prepares initial feedback before propagation. Outputs and
-repeated reads reuse that result: a continuous single-endpoint run of `N`
-steps requires `N+1` evaluations per bead. Window samples count accepted
-physical frames, starting with frame 0.
+### Output and restart
 
-Constant-potential checkpoints use `state_format="checkpoint_v1"`. They save
-feedback initialization, the accepted frame, history, random state, electronic
-momentum, and thermostat/protocol work, with at least 17 significant digits
-for physical floating-point state. Restart recomputes the saved boundary and
-replaces that frame's feedback sample before advancing. Checkpoints without
-the required lifecycle fields are rejected. Normal new inputs use the default
-`state_format="auto"`; explicit inline initial states can use `initial`.
+`electronic_charge` reports the total electron count $q$, while `fermi_level` and `workfunction` report the current feedback. The Ne moving average is available as `workfunction_steps_average`. Targets, electronic momentum, and the grand potential can also be added to the properties list.
 
-## Verification
-
-ABACUS keeps its focused C++ protocol, state, occupation, and INPUT tests. This
-repository contains the real-client cases and Python verification suite.
-With matched modified and unmodified ABACUS builds, run:
+To restart, read the generated checkpoint. `total_steps` specifies the final step count: set it to a value greater than the current `step` in the checkpoint, then run:
 
 ```bash
-export ABACUS_CP_EXECUTABLE=/path/to/modified/abacus
-export ABACUS_REFERENCE_EXECUTABLE=/path/to/original/abacus
-export ABACUS_PP_ORB=/path/to/abacus-source/tests/PP_ORB
-cd examples/clients/abacus/validation
-bash tests/run_develop_core.sh /path/to/new-test-output
+i-pi simulation.restart > ipi-restart.log 2>&1
 ```
 
-The develop-core selection contains the 38 checks used for electron-count
-changes, static references, cube potentials, ordinary calculations and socket
-sessions, ASE, trajectories, and restart. The full suite remains available
-through `tests/run_acceptance.sh`. Dependencies and collection-only commands
-are documented in the [validation README](examples/clients/abacus/validation/README.md).
+## Examples and validation
+
+| Directory | Contents |
+|---|---|
+| [1-pes-fermi](examples/constant_potential/1-pes-fermi/) | Constant-Fermi-level dynamics with an analytical potential |
+| [2-vasp-implicit](examples/constant_potential/2-vasp-implicit/) | Constant-work-function dynamics with VASPsol++ implicit electrolyte and `SOL_UPDATE` |
+| [3-vasp-Ne](examples/constant_potential/3-vasp-Ne/) | Constant-work-function dynamics with a VASP Ne counter-electrode |
+| [4-cp2k-implicit-mixing](examples/constant_potential/4-cp2k-implicit-mixing/) | CP2K implicit dielectric environment with two integer endpoints through FARMING |
+| [5-cp2k-Ne](examples/constant_potential/5-cp2k-Ne/) | Constant-work-function dynamics with fractional electron counts and a CP2K Ne counter-electrode |
+| [6-abacus-pw-compensating-charge](examples/constant_potential/6-abacus-pw-compensating-charge/) | ABACUS PW with planar compensating charge |
+| [7-abacus-lcao-compensating-charge](examples/constant_potential/7-abacus-lcao-compensating-charge/) | ABACUS LCAO with planar compensating charge |
 
 ## Citation
 
-If you use this project in your research, please cite both the
-constant-potential framework paper and the i-PI 3.0 paper:
+When using this project, please cite the constant-potential method paper and the i-PI 3.0 paper:
 
 ```bibtex
 @article{zhang2026flexible,

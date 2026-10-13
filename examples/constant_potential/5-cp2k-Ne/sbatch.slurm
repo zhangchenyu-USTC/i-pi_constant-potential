@@ -4,12 +4,7 @@
 #SBATCH --output=%j.out
 #SBATCH --error=%j.err
 
-source /path/to/ipi/env.sh
-
-i-pi input.xml > ipi.log 2>&1 &
-
-sleep 5
-
-mpirun -np 64 /path/to/cp2k.psmp -i cp2k.inp -o cp2k.out
-
-wait
+set -euo pipefail
+# Activate i-PI/CP2K and set CP2K_EXECUTABLE before submitting this script.
+cd "${SLURM_SUBMIT_DIR:-$(dirname -- "${BASH_SOURCE[0]}")}"
+exec bash run.sh --ranks "${SLURM_NTASKS:-64}" --output "run-${SLURM_JOB_ID:-local}" "$@"

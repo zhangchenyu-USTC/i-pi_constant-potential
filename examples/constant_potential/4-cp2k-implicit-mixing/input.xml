@@ -50,15 +50,14 @@
         <thermostat mode="svr"><tau units="femtosecond">200.0</tau></thermostat>
 		
         <electrons enabled="true" charge_mixing="true">
+          <charge_mixing_low>cp2k_low</charge_mixing_low>
+          <charge_mixing_high>cp2k_high</charge_mixing_high>
           <target_workfunction units="electronvolt">4.0</target_workfunction>
           <potential_average_axis>z</potential_average_axis>
           <potential_average_region units="angstrom">[12.5, 15.0]</potential_average_region>
           <neutral_electrons>108</neutral_electrons>
           <q_init>107.5</q_init>
           <mass units="atomic_unit">400.0</mass>
-          <!-- CP2K does not expose the complete implicit-solvent response separately from the ordinary electrostatic state, 
-          so the solvent contribution cannot be safely frozen and replayed; this value must remain 1. -->
-          <solvation_update_stride>1</solvation_update_stride>
           <potentiostat mode="svr">
             <tau units="femtosecond">200.0</tau>
             <temp units="kelvin">300.0</temp>

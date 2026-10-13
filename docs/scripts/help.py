@@ -32,6 +32,7 @@ from ipi.inputs import (
     barostats,
     beads,
     cell,
+    electrons,
     ensembles,
     forcefields,
     forces,
@@ -66,6 +67,8 @@ objects = {
     "ensemble": ensembles.InputEnsemble(),
     "bias": forces.InputForces(),
     "dynamics": motion.dynamics.InputDynamics(),
+    "electrons": electrons.InputElectrons(),
+    "potentiostat": electrons.InputPotentiostat(),
     "constrained_dynamics": motion.constrained_dynamics.InputConstrainedDynamics(),
     "driven_dynamics": motion.driven_dynamics.InputDrivenDynamics(),
     "bec": motion.driven_dynamics.InputBEC(),
@@ -160,7 +163,8 @@ parser.add_option(
     help="Root object for the help files. Options: \
      ['barostats', 'cell', 'simulation', 'ensembles',\
       'thermostats', 'interface', 'forces', 'atoms', 'beads',\
-      'prng', 'output', 'trajectory', 'properties', 'checkpoint']",
+      'prng', 'output', 'trajectory', 'properties', 'checkpoint', 'electrons',\
+      'potentiostat']",
     default="simulation",
 )
 parser.add_option(
