@@ -9,3 +9,12 @@ Installation and constant-potential settings are described in the
 The PW and LCAO examples are in `../../constant_potential/`. They use native
 plane-charge compensation and the socket interface. `historical/` contains
 the 3.10.0 patches; `pw-example/` accompanies that older ordinary interface.
+
+Constant-potential electron control rejects `assume_isolated=makov-payne`
+(including `mp` and `m-p`), because the native correction changes the energy
+without a matching electronic potential. Ordinary Makov–Payne calculations
+retain their native behavior.
+
+[PW/LCAO examples and real-client validation](https://github.com/zhangchenyu-USTC/i-pi_constant-potential/tree/630a6254112eb885f0c428bdf16540bb436b701d/examples/clients/abacus/validation)
+are available on the validation branch. Its runner selects 46 checks, including
+the Makov–Payne rejection and ordinary SCF/socket comparisons.
