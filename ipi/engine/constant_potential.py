@@ -273,7 +273,6 @@ class ConstantPotentialSocketMixin:
         self.electrons_config = None
         self._dynamics_ref = None
         self._charge_mixing_endpoint = False
-        self._potential_average_region_A = None
 
     def _validate_transport(self):
         mode = str(getattr(self.socket, "mode", "inet"))
@@ -334,23 +333,6 @@ class ConstantPotentialSocketMixin:
 
     def _mode_flags(self):
         return 2 if self.Ne_doping else 0
-
-    def _workfunction_region_A(self):
-        if self._potential_average_region_A is not None:
-            return self._potential_average_region_A
-        region = np.asarray(
-            self.electrons_config.get("potential_average_region", []), dtype=float
-        ).reshape(-1)
-        if (
-            region.size != 2
-            or not np.all(np.isfinite(region))
-            or region[1] <= region[0]
-        ):
-            raise ValueError("Invalid workfunction potential_average_region.")
-        self._potential_average_region_A = tuple(
-            float(unit_to_user("length", "angstrom", value)) for value in region
-        )
-        return self._potential_average_region_A
 
     def _prepare_request(self, request, request_context):
         request = super()._prepare_request(request, request_context)

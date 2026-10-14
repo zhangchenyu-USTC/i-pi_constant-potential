@@ -31,3 +31,8 @@ that historical ordinary interface.
 [Examples and real-client tests](validation/README.md) are maintained here in
 the i-PI repository. They include Si2 and Al36 PW/LCAO inputs, a local MPI
 launcher, and the electron-count, static-reference, ASE, and restart tests.
+
+Constant-potential electron control rejects `assume_isolated=makov-payne`
+(including `mp` and `m-p`), because the native correction changes the energy
+without a matching electronic potential. Ordinary Makov–Payne calculations
+retain their native behavior.

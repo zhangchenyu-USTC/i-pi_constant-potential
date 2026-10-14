@@ -16,6 +16,7 @@ from ipi.engine.potentiostat import PotentiostatSVR
 from ipi.inputs.electrons import InputElectrons
 from ipi.inputs.simulation import InputSimulation
 from ipi.inputs.prng import NumpyEncoder
+from ipi.utils.depend import dstrip
 from ipi.utils.io.inputs.io_xml import write_float
 from ipi.utils.io.inputs.serialization import checkpoint_serialization
 from ipi.utils.units import Constants
@@ -94,10 +95,12 @@ def state(sim):
     system = sim.syslist[0]
     es = system.motion.electronic_state
     return {
-        "R": np.array(system.beads.q),
-        "P": np.array(system.beads.p),
-        "cell": np.array(system.cell.h),
-        "barostat_p": np.array(getattr(system.motion.barostat, "p", [])),
+        "R": dstrip(system.beads.q).copy(),
+        "P": dstrip(system.beads.p).copy(),
+        "cell": dstrip(system.cell.h).copy(),
+        "barostat_p": np.asarray(
+            dstrip(getattr(system.motion.barostat, "p", []))
+        ).copy(),
         "nuclear_ethermo": system.motion.thermostat.ethermo,
         "barostat_ethermo": system.motion.barostat.thermostat.ethermo,
         "q": es.q,
@@ -292,6 +295,50 @@ def test_ne_feedback_read_and_same_frame_refresh_do_not_add_samples():
     motion._prepare_electronic_boundary(1)
     assert state(resumed)["samples"] == saved["samples"]
     assert len(resumed.fflist["cp"].driver.calls) == 1
+
+
+@pytest.mark.parametrize("changed", ["positions", "cell"])
+def test_inplace_boundary_change_refreshes_feedback_without_adding_samples(changed):
+    class CellFeedbackPES(CoupledPES):
+        def __call__(self, cell, pos):
+            self.shift = 0.01 * (cell[0, 0] - 100.0)
+            return super().__call__(cell, pos)
+
+    sim = load(input_xml(steps=1, ne=True))
+    driver = CellFeedbackPES()
+    sim.fflist["cp"].driver = driver
+    sim.run(write_outputs=False)
+    motion = sim.syslist[0].motion
+    es = motion.electronic_state
+    saved = state(sim)
+    calls = len(driver.calls)
+    snapshot = motion._electronic_boundary_state
+    assert not np.shares_memory(snapshot[0], dstrip(motion.beads.q))
+    assert not np.shares_memory(snapshot[1], dstrip(motion.cell.h))
+
+    if changed == "positions":
+        motion.beads.q[0, 0] += 0.2
+        assert snapshot[0][0, 0] == saved["R"][0, 0]
+    else:
+        motion.cell.h[0, 0] += 2.0
+        assert snapshot[1][0, 0] == saved["cell"][0, 0]
+    motion._prepare_electronic_boundary(saved["frame"])
+    expected_mu = (
+        motion.beads.q[0, 0] + es.q - 8.0 + 0.01 * (motion.cell.h[0, 0] - 100.0)
+    )
+    assert len(driver.calls) == calls + 1
+    assert es.current_ef == pytest.approx(expected_mu)
+    assert es.current_workfunction == pytest.approx(-expected_mu)
+    assert es.accepted_frame_id == saved["frame"]
+    assert es._workfunction_average_total_samples == saved["samples"]
+    assert es._workfunction_average_history[:-1] == saved["history"][:-1]
+    assert es._workfunction_average_history[-1] == pytest.approx(-expected_mu)
+    assert es.current_workfunction_steps_average == pytest.approx(
+        np.mean(es._workfunction_average_history)
+    )
+    motion._prepare_electronic_boundary(saved["frame"])
+    assert len(driver.calls) == calls + 1
+    assert es._workfunction_average_total_samples == saved["samples"]
 
 
 @pytest.mark.parametrize("prepared", [False, True])

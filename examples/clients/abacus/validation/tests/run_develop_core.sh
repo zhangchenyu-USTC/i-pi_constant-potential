@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the 38 real-client checks used for the develop constant-potential patch.
+# Run the core real-client checks, including Makov-Payne session boundaries.
 set -euo pipefail
 CP_TEST_DIRECTORY="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ $# -lt 1 || $# -gt 2 || -e "$1" || ( $# == 2 && "$2" != --collect-only ) ]]; then

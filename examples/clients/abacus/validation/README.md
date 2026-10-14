@@ -52,15 +52,16 @@ the [client README](../README.md), applying the patch only to the candidate.
 Load their runtime libraries in the shell before running the tests. Use this
 i-PI checkout for the server as well as the examples.
 
-`run_develop_core.sh` selects the **38 checks** used to validate the develop
-patch after upstream #8119. They cover dynamic electron counts and positions,
+`run_develop_core.sh` selects **46 checks** for the develop patch, including the
+Makov–Payne electronic-control rejection and ordinary SCF/socket comparisons.
+They cover dynamic electron counts and positions,
 static references, cube potentials, ordinary SCF/MD/relax and socket sessions,
 native implicit solvent, k-point pools, ASE, i-PI trajectories, and restart.
 The default is four MPI ranks, needed for the parallel cases. The launcher
 records executable hashes and treats skipped tests as failures. Logs and
 JUnit results are saved in the new output directory.
 
-To check dependencies and list the same 38 tests without starting a
+To check dependencies and list the selected tests without starting a
 calculation, append `--collect-only` and use a separate new output directory.
 Collection requires the executable and data paths above. The full regression
 suite, including additional occupation, electronic-method, and dynamics

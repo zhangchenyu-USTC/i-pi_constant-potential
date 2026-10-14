@@ -439,8 +439,8 @@ class Dynamics(Motion):
         state.feedback_initialized = True
         state.accepted_frame_id = frame_id
         self._electronic_boundary_state = (
-            np.array(self.beads.q, copy=True),
-            np.array(self.cell.h, copy=True),
+            dstrip(self.beads.q).copy(),
+            dstrip(self.cell.h).copy(),
             state.q,
         )
         self._electronic_boundary_needs_refresh = False
