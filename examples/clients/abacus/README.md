@@ -18,3 +18,8 @@ retain their native behavior.
 [PW/LCAO examples and real-client validation](https://github.com/zhangchenyu-USTC/i-pi_constant-potential/tree/630a6254112eb885f0c428bdf16540bb436b701d/examples/clients/abacus/validation)
 are available on the validation branch. Its runner selects 46 checks, including
 the Makov–Payne rejection and ordinary SCF/socket comparisons.
+
+Electron requests are coordinated by `source_relax/socket_constant_potential`;
+`source_estate` owns the electronic data types, occupation checks, state updates
+and reference-potential calculation. The socket protocol and i-PI inputs are
+unchanged.

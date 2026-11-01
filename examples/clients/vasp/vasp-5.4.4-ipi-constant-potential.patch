@@ -806,11 +806,23 @@ diff --git a/src/main.F b/src/main.F
  
        IF (DYN%IBRION==-1 .OR. DYN%IBRION==5 .OR. DYN%IBRION==6 .OR. &
 -           DYN%IBRION==7.OR.DYN%IBRION==8) THEN
-+           DYN%IBRION==7.OR.DYN%IBRION==8 .OR. DYN%IBRION==23) THEN
++           DYN%IBRION==7.OR.DYN%IBRION==8 .OR. DYN%IBRION==23 .OR. DYN%IBRION==24) THEN
           EENTROPY=E%EENTROPY*SCALEE
           io_begin
           WRITE(17 ,7281,ADVANCE='NO') NSTEP,TOTEN, &
-@@ -3371,6 +3717,404 @@
+@@ -3217,6 +3563,11 @@
+          ENDIF
+ 
+          IF (M_CONSTRAINED()) CALL WRITE_CONSTRAINED_M(17,.TRUE.)
++
++! Make the completed frame visible before waiting for the next socket request.
++         IF (DYN%IBRION==23 .OR. DYN%IBRION==24) THEN
++            IF (IO%LOPEN) CALL WFORCE(17)
++         ENDIF
+ 
+          io_end
+       ENDIF
+@@ -3371,6 +3722,404 @@
       &   ' F= ',E14.8,' E0= ',E14.8,1X,' EK= ',E11.5, &
       &   ' SP= ',E8.2,' SK= ',E8.2)
  77280 FORMAT(' mag=',3F11.3)
@@ -1215,7 +1227,7 @@ diff --git a/src/main.F b/src/main.F
  
  !=======================================================================
  ! DYN%IBRION =
-@@ -3707,10 +4451,15 @@
+@@ -3707,10 +4456,15 @@
          
  !-----------------------------------------------------------------------
  ! update number of electrons for constant potential calculation
@@ -1235,7 +1247,7 @@ diff --git a/src/main.F b/src/main.F
  !-----------------------------------------------------------------------
          
          io_begin
-@@ -4283,7 +5032,7 @@
+@@ -4283,7 +5037,7 @@
  ! comment out the following line to add  exchange correlation
           IF (IO%LVHAR) CALL SET_LEXCH(-1)
           ! solvation - write out ionic and bound charges in vaspsol
@@ -1244,7 +1256,7 @@ diff --git a/src/main.F b/src/main.F
           ! solvation - 
           CALL POTLOK(GRID,GRIDC,GRID_SOFT, WDES%COMM_INTER, WDES, &
                    INFO,P,T_INFO,E,LATT_CUR, &
-@@ -4297,9 +5046,11 @@
+@@ -4297,9 +5051,11 @@
  
           ! call the dipol routine without changing the potential
           IF ( DIP%IDIPCO >0 ) THEN
@@ -1256,7 +1268,7 @@ diff --git a/src/main.F b/src/main.F
  
             CALL WRITE_VACUUM_LEVEL(IO%IU6)
           ENDIF
-@@ -4715,6 +5466,93 @@
+@@ -4715,6 +5471,93 @@
  
        CONTAINS
  

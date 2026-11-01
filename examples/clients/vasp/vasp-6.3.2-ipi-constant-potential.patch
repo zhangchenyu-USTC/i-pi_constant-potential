@@ -1,0 +1,1705 @@
+diff --git a/src/.objects b/src/.objects
+--- a/src/.objects
++++ b/src/.objects
+@@ -2,6 +2,8 @@
+ 	c2f_interface.o \
+ 	nccl2for.o \
+ 	simd.o \
++	sockets.o \
++	fsockets.o \
+ 	base.o \
+ 	profiling.o \
+ 	string.o \
+diff --git a/src/base.F b/src/base.F
+--- a/src/base.F
++++ b/src/base.F
+@@ -137,6 +137,7 @@
+         LOGICAL LCHARG               !< write CHGCAR
+         LOGICAL LVTOT                !< write total local potential to LOCPOT
+         LOGICAL LVHAR                !< write Hartree potential to LOCPOT
++        LOGICAL LSOL_WRITE           !< write VASPsol auxiliary potential grids
+         LOGICAL LPDENS               !< write partial density (charge density for one band)
+         INTEGER LORBIT               !< write orbit/dos
+         LOGICAL LELF                 !< write elf
+diff --git a/src/fileio.F b/src/fileio.F
+--- a/src/fileio.F
++++ b/src/fileio.F
+@@ -1904,6 +1904,91 @@
+ 
+ 
+ 
++      SUBROUTINE POTENTIAL_AVERAGE_FROM_CVTOT(GRIDC, LATT_CUR, CVTOT, AXIS, &
++     &                                        REGION_MIN_A, REGION_MAX_A, VAC_LEVEL_EV)
++      USE prec
++      USE mgrid
++      USE lattice
++      USE tutor, ONLY : vtutor, isError
++      IMPLICIT NONE
++
++      TYPE (grid_3d) GRIDC
++      TYPE (latt)    LATT_CUR
++      RGRID CVTOT(GRIDC%RL%NP)
++      INTEGER :: AXIS
++      REAL(q) :: REGION_MIN_A, REGION_MAX_A
++      REAL(q) :: VAC_LEVEL_EV
++      INTEGER :: GRID_SIZE(3), GRID_COORDINATES(3), N_IN, NC, NR, NFAST
++      REAL(q) :: CELL_HEIGHT, COORDINATE, CROSS_VECTOR(3), FACE_NORM
++      REAL(q) :: SUM_IN_REGION
++
++      GRID_SIZE = (/GRIDC%NGX,GRIDC%NGY,GRIDC%NGZ/)
++      IF (ANY(GRID_SIZE<=0)) THEN
++         WRITE(*,*) 'ERROR: Invalid FFT grid in POTENTIAL_AVERAGE_FROM_CVTOT.'
++         CALL vtutor%stopCode(isError)
++      ENDIF
++      IF (AXIS<1 .OR. AXIS>3) THEN
++         WRITE(*,*) 'ERROR: potential_average_axis must be x, y, or z.'
++         CALL vtutor%stopCode(isError)
++      ENDIF
++      SELECT CASE (AXIS)
++      CASE (1)
++         CROSS_VECTOR(1)=LATT_CUR%A(2,2)*LATT_CUR%A(3,3)-LATT_CUR%A(3,2)*LATT_CUR%A(2,3)
++         CROSS_VECTOR(2)=LATT_CUR%A(3,2)*LATT_CUR%A(1,3)-LATT_CUR%A(1,2)*LATT_CUR%A(3,3)
++         CROSS_VECTOR(3)=LATT_CUR%A(1,2)*LATT_CUR%A(2,3)-LATT_CUR%A(2,2)*LATT_CUR%A(1,3)
++      CASE (2)
++         CROSS_VECTOR(1)=LATT_CUR%A(2,3)*LATT_CUR%A(3,1)-LATT_CUR%A(3,3)*LATT_CUR%A(2,1)
++         CROSS_VECTOR(2)=LATT_CUR%A(3,3)*LATT_CUR%A(1,1)-LATT_CUR%A(1,3)*LATT_CUR%A(3,1)
++         CROSS_VECTOR(3)=LATT_CUR%A(1,3)*LATT_CUR%A(2,1)-LATT_CUR%A(2,3)*LATT_CUR%A(1,1)
++      CASE (3)
++         CROSS_VECTOR(1)=LATT_CUR%A(2,1)*LATT_CUR%A(3,2)-LATT_CUR%A(3,1)*LATT_CUR%A(2,2)
++         CROSS_VECTOR(2)=LATT_CUR%A(3,1)*LATT_CUR%A(1,2)-LATT_CUR%A(1,1)*LATT_CUR%A(3,2)
++         CROSS_VECTOR(3)=LATT_CUR%A(1,1)*LATT_CUR%A(2,2)-LATT_CUR%A(2,1)*LATT_CUR%A(1,2)
++      END SELECT
++      FACE_NORM=SQRT(SUM(CROSS_VECTOR*CROSS_VECTOR))
++      IF (FACE_NORM<=0._q .OR. LATT_CUR%OMEGA<=0._q) THEN
++         WRITE(*,*) 'ERROR: Invalid lattice for planar potential averaging.'
++         CALL vtutor%stopCode(isError)
++      ENDIF
++      CELL_HEIGHT=LATT_CUR%OMEGA/FACE_NORM
++      IF (REGION_MIN_A<0._q .OR. REGION_MAX_A<=REGION_MIN_A .OR. &
++     &    REGION_MAX_A>CELL_HEIGHT+1.E-10_q) THEN
++         WRITE(*,*) 'ERROR: potential_average_region is outside the selected cell height.'
++         CALL vtutor%stopCode(isError)
++      ENDIF
++
++      SUM_IN_REGION = 0._q
++      N_IN = 0
++      ! RL is x-fast for serial FFTs and z-fast for distributed FFTs.
++      ! Only visit owned real-space points; reciprocal half-grid packing
++      ! does not change this layout. GRIDC%COMM excludes replicated k groups.
++      NFAST=GRIDC%RL%NFAST
++      DO NC=1,GRIDC%RL%NCOL
++         GRID_COORDINATES(MOD(NFAST,3)+1)=GRIDC%RL%I2(NC)-1
++         GRID_COORDINATES(MOD(NFAST+1,3)+1)=GRIDC%RL%I3(NC)-1
++         DO NR=1,GRIDC%RL%NROW
++            GRID_COORDINATES(NFAST)=NR-1
++            COORDINATE=REAL(GRID_COORDINATES(AXIS),q)/REAL(GRID_SIZE(AXIS),q)*CELL_HEIGHT
++            IF (COORDINATE.GE.REGION_MIN_A .AND. COORDINATE.LE.REGION_MAX_A) THEN
++               SUM_IN_REGION=SUM_IN_REGION+REAL(CVTOT((NC-1)*GRIDC%RL%NROW+NR),q)
++               N_IN=N_IN+1
++            ENDIF
++         ENDDO
++      ENDDO
++      CALLMPI( M_sum_d(GRIDC%COMM,SUM_IN_REGION,1))
++      CALLMPI( M_sum_i(GRIDC%COMM,N_IN,1))
++
++      IF (N_IN>0) THEN
++         VAC_LEVEL_EV = SUM_IN_REGION / REAL(N_IN, q)
++      ELSE
++         WRITE(*,*) 'ERROR: No FFT grid points fall inside potential_average_region.'
++         CALL vtutor%stopCode(isError)
++      ENDIF
++
++      RETURN
++      END SUBROUTINE
++
++
+ !***********************************************************************
+ !  write out initial header for PCDAT
+ !***********************************************************************
+diff --git a/src/fsockets.f90 b/src/fsockets.f90
+new file mode 100644
+--- /dev/null
++++ b/src/fsockets.f90
+@@ -0,0 +1,202 @@
++!F90 ISO_C_BINGING wrapper for socket communication.
++
++!Copyright (C) 2013, Michele Ceriotti
++
++!Permission is hereby granted, free of charge, to any person obtaining
++!a copy of this software and associated documentation files (the
++!"Software"), to deal in the Software without restriction, including
++!without limitation the rights to use, copy, modify, merge, publish,
++!distribute, sublicense, and/or sell copies of the Software, and to
++!permit persons to whom the Software is furnished to do so, subject to
++!the following conditions:
++
++!The above copyright notice and this permission notice shall be included
++!in all copies or substantial portions of the Software.
++
++!THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++!EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++!MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++!IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++!CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++!TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++!SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++
++!Contains both the functions that transmit data to the socket and read the data
++!back out again once finished, and the function which opens the socket initially.
++
++!Functions:
++!   open_socket: Opens a socket with the required host server, socket type and
++!      port number.
++!   write_buffer: Writes a string to the socket.
++!   read_buffer: Reads data from the socket.
++
++   MODULE F90SOCKETS
++   USE ISO_C_BINDING
++   
++   IMPLICIT NONE
++
++  INTERFACE writebuffer
++      MODULE PROCEDURE writebuffer_s, &
++                       writebuffer_d, writebuffer_dv, &
++                       writebuffer_i
++                       
++  END INTERFACE 
++
++  INTERFACE readbuffer
++      MODULE PROCEDURE readbuffer_s, &
++                       readbuffer_dv, readbuffer_d, &
++                       readbuffer_i
++                       
++  END INTERFACE 
++
++  INTERFACE
++    SUBROUTINE open_csocket(psockfd, inet, port, host) BIND(C, name="open_socket")
++      USE ISO_C_BINDING
++    INTEGER(KIND=C_INT)                      :: psockfd, inet, port
++    CHARACTER(KIND=C_CHAR), DIMENSION(*)     :: host
++
++    END SUBROUTINE open_csocket
++
++    
++    SUBROUTINE writebuffer_csocket(psockfd, pdata, plen) BIND(C, name="writebuffer")
++      USE ISO_C_BINDING
++    INTEGER(KIND=C_INT)                      :: psockfd
++    TYPE(C_PTR), VALUE                       :: pdata
++    INTEGER(KIND=C_INT)                      :: plen
++
++    END SUBROUTINE writebuffer_csocket       
++
++    SUBROUTINE readbuffer_csocket(psockfd, pdata, plen) BIND(C, name="readbuffer")
++      USE ISO_C_BINDING
++    INTEGER(KIND=C_INT)                      :: psockfd
++    TYPE(C_PTR), VALUE                       :: pdata
++    INTEGER(KIND=C_INT)                      :: plen
++
++    END SUBROUTINE readbuffer_csocket   
++  END INTERFACE
++
++   CONTAINS
++   
++   SUBROUTINE open_socket(psockfd, inet, port, host)      
++      IMPLICIT NONE
++      INTEGER, INTENT(IN) :: inet, port
++      INTEGER, INTENT(OUT) :: psockfd
++      CHARACTER(LEN=1024), INTENT(IN) :: host
++      CHARACTER(LEN=1,KIND=C_CHAR) :: chost(1024)
++
++      CALL fstr2cstr(host, chost)
++      CALL open_csocket(psockfd, inet, port, host)
++   END SUBROUTINE
++
++   SUBROUTINE fstr2cstr(fstr, cstr, plen)
++      IMPLICIT NONE
++      CHARACTER(LEN=*), INTENT(IN) :: fstr
++      CHARACTER(LEN=1,KIND=C_CHAR), INTENT(OUT) :: cstr(:)
++      INTEGER, INTENT(IN), OPTIONAL :: plen
++      
++      INTEGER i,n
++      IF (PRESENT(plen)) THEN
++         n = plen
++         DO i=1,n
++            cstr(i) = fstr(i:i)
++         ENDDO
++      ELSE
++         n = LEN_TRIM(fstr)
++         DO i=1,n
++            cstr(i) = fstr(i:i)
++         ENDDO
++         cstr(n+1) = C_NULL_CHAR
++      END IF
++   END SUBROUTINE
++
++  SUBROUTINE writebuffer_d (psockfd, fdata)
++      USE ISO_C_BINDING
++    INTEGER, INTENT(IN)                      :: psockfd
++    REAL(KIND=8), INTENT(IN)                :: fdata
++
++    REAL(KIND=C_DOUBLE), TARGET              :: cdata
++
++      cdata = fdata
++      CALL writebuffer_csocket(psockfd, c_loc(cdata), 8)
++  END SUBROUTINE
++
++  SUBROUTINE writebuffer_i (psockfd, fdata)
++      USE ISO_C_BINDING
++    INTEGER, INTENT(IN)                      :: psockfd, fdata
++
++    INTEGER(KIND=C_INT), TARGET              :: cdata
++
++      cdata = fdata
++      CALL writebuffer_csocket(psockfd, c_loc(cdata), 4)
++  END SUBROUTINE
++
++  SUBROUTINE writebuffer_s (psockfd, fstring, plen)
++      USE ISO_C_BINDING
++    INTEGER, INTENT(IN)                      :: psockfd
++    CHARACTER(LEN=*), INTENT(IN)             :: fstring
++    INTEGER, INTENT(IN)                      :: plen
++
++    INTEGER                                  :: i
++    CHARACTER(LEN=1, KIND=C_CHAR), TARGET    :: cstring(plen)
++
++      DO i = 1,plen
++         cstring(i) = fstring(i:i)
++      ENDDO
++      CALL writebuffer_csocket(psockfd, c_loc(cstring(1)), plen)
++  END SUBROUTINE
++
++  SUBROUTINE writebuffer_dv(psockfd, fdata, plen)
++      USE ISO_C_BINDING  
++    INTEGER, INTENT(IN)                      :: psockfd, plen
++    REAL(KIND=8), INTENT(IN), TARGET        :: fdata(plen)
++
++      CALL writebuffer_csocket(psockfd, c_loc(fdata(1)), 8*plen)
++  END SUBROUTINE
++
++  SUBROUTINE readbuffer_d (psockfd, fdata)
++      USE ISO_C_BINDING
++    INTEGER, INTENT(IN)                      :: psockfd
++    REAL(KIND=8), INTENT(OUT)               :: fdata
++
++    REAL(KIND=C_DOUBLE), TARGET              :: cdata
++
++      CALL readbuffer_csocket(psockfd, c_loc(cdata), 8)
++      fdata=cdata
++  END SUBROUTINE
++
++  SUBROUTINE readbuffer_i (psockfd, fdata)
++      USE ISO_C_BINDING
++    INTEGER, INTENT(IN)                      :: psockfd
++    INTEGER, INTENT(OUT)                     :: fdata
++
++    INTEGER(KIND=C_INT), TARGET              :: cdata
++
++      CALL readbuffer_csocket(psockfd, c_loc(cdata), 4)
++      fdata = cdata
++  END SUBROUTINE
++
++  SUBROUTINE readbuffer_s (psockfd, fstring, plen)
++      USE ISO_C_BINDING
++    INTEGER, INTENT(IN)                      :: psockfd
++    CHARACTER(LEN=*), INTENT(OUT)            :: fstring
++    INTEGER, INTENT(IN)                      :: plen
++
++    INTEGER                                  :: i
++    CHARACTER(LEN=1, KIND=C_CHAR), TARGET    :: cstring(plen)
++
++      CALL readbuffer_csocket(psockfd, c_loc(cstring(1)), plen)
++      fstring=""   
++      DO i = 1,plen
++         fstring(i:i) = cstring(i)
++      ENDDO
++  END SUBROUTINE
++
++  SUBROUTINE readbuffer_dv(psockfd, fdata, plen)
++      USE ISO_C_BINDING  
++    INTEGER, INTENT(IN)                      :: psockfd, plen
++    REAL(KIND=8), INTENT(OUT), TARGET       :: fdata(plen)
++
++      CALL readbuffer_csocket(psockfd, c_loc(fdata(1)), 8*plen)
++  END SUBROUTINE
++  END MODULE
+diff --git a/src/main.F b/src/main.F
+--- a/src/main.F
++++ b/src/main.F
+@@ -152,6 +152,9 @@
+       USE chi_GG
+       USE time_propagation
+ #endif
++! ipi socket module
++      USE F90SOCKETS, ONLY : open_socket, writebuffer, readbuffer
++      USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY : IEEE_IS_FINITE
+ ! Thomas Bucko's code contributions
+ #ifdef tbdyn
+       USE random_seeded
+@@ -300,6 +303,33 @@
+       LOGICAL :: LNBANDS=.TRUE.
+       INTEGER :: TIU6, TIU0
+       !INTEGER :: MDALGO=0           ! dublicates MDALGO in tbdyn
++      
++      ! ipi socket variables
++      INTEGER, PARAMETER :: MSGLEN=12 ! length of headers of driver/wrapper commun. protocol
++      INTEGER :: SOCKET, PORT       ! socket ID, port
++      INTEGER :: INET               ! socket mode: 0 = unix, 1 = inet
++      CHARACTER(LEN=1024) :: IHOST  ! address of the server
++      CHARACTER(LEN=12) :: HEADER   ! socket communication buffers
++      INTEGER :: IMSG               ! 1 status, 2 posdata, 3 getforce, 4 other
++      LOGICAL :: HASDATA
++      ! ipi variables for the system
++      INTEGER :: NAT
++      REAL(q) :: IPIPOT
++      REAL(q), ALLOCATABLE :: IPIATOMS(:), IPIFORCES(:)
++      REAL(q) :: CELL_H(9), CELL_IH(9), VIRIAL(9)
++      ! unit conversion
++      REAL(q) :: EVTOHA, FOCTOAU
++      ! Constant-potential request and completed-frame state.
++      LOGICAL :: INIT_DONE_24, NE_DOPING_MODE
++      LOGICAL :: IPI_CHGDATA_READY, IPI_RESULT_VALID, IPI_OBSERVABLES_READY
++      LOGICAL :: IPI_WORKFUNCTION_VALID
++      INTEGER :: NE_SPECIES_TYPE, POTENTIAL_AVERAGE_AXIS
++      REAL(q) :: NEUTRAL_ELECTRONS_REF
++      REAL(q) :: POTENTIAL_AVERAGE_MIN_A, POTENTIAL_AVERAGE_MAX_A
++      REAL(q) :: IPI_FERMI_EV, IPI_NELECT, IPI_VAC_LEVEL_EV, IPI_WORKFUNCTION_EV
++      INTEGER :: EXTRALEN
++      CHARACTER(LEN=256) :: EXTRAJSON
++
+ !=======================================================================
+ !  begin array dimensions ...
+ !=======================================================================
+@@ -442,6 +472,26 @@
+ ! Variables which require zero-initialization:
+       TSIF = 0.0_q
+ 
++      ! ipi initialize variables
++      EVTOHA = 1_q/(2_q*13.605693)
++      FOCTOAU = AUTOA*EVTOHA
++      HASDATA = .FALSE.
++      INIT_DONE_24=.FALSE.
++      NE_DOPING_MODE=.FALSE.
++      IPI_CHGDATA_READY=.FALSE.
++      IPI_RESULT_VALID=.FALSE.
++      IPI_OBSERVABLES_READY=.FALSE.
++      IPI_WORKFUNCTION_VALID=.FALSE.
++      NE_SPECIES_TYPE=0
++      NEUTRAL_ELECTRONS_REF=0._q
++      POTENTIAL_AVERAGE_AXIS=0
++      POTENTIAL_AVERAGE_MIN_A=0._q
++      POTENTIAL_AVERAGE_MAX_A=0._q
++      IPI_FERMI_EV=0._q
++      IPI_NELECT=0._q
++      IPI_VAC_LEVEL_EV=0._q
++      IPI_WORKFUNCTION_EV=0._q
++
+ #ifdef libbeef
+       LBEEFCALCBASIS = .FALSE.
+ #endif
+@@ -645,7 +695,7 @@
+           DYN%PSTRESS,INFO%NDAV, &
+           KPOINTS%SIGMA,KPOINTS%LTET,INFO%WEIMIN,INFO%EBREAK,INFO%DEPER,IO%NWRITE,INFO%LCORR, &
+           IO%IDIOT,T_INFO%NIONS,T_INFO%NTYPP,IO%LMUSIC,IO%LOPTICS,STM, &
+-          INFO%ISPIN,T_INFO%ATOMOM,NIOND,IO%LWAVE,IO%LDOWNSAMPLE,IO%LCHARG,IO%LVTOT,IO%LVHAR,INFO%SZPREC, &
++          INFO%ISPIN,T_INFO%ATOMOM,NIOND,IO%LWAVE,IO%LDOWNSAMPLE,IO%LCHARG,IO%LVTOT,IO%LVHAR,IO%LSOL_WRITE,INFO%SZPREC, &
+           INFO%ENAUG,IO%LORBIT,IO%LELF,T_INFO%ROPT,INFO%ENINI, &
+           NGX,NGY,NGZ,NGXC,NGYC,NGZC,NBANDS,WDES%NBANDSLOW,WDES%NBANDSHIGH,NEDOS,NBLK,LATT_CUR, &
+           LPLANE_WISE,LCOMPAT,LMAX_CALC,SET_LMAX_MIX_TO,WDES%NSIM,LPARD,LPAW,LADDGRID, &
+@@ -654,6 +704,7 @@
+           INFO%LASPH,INFO%TURBO,INFO%IRESTART,INFO%NREBOOT,INFO%NMIN,INFO%EREF, &
+           INFO%NLSPLINE,FFTW_PLAN_EFFORT, &
+           IO%LH5, IO%LWAVEH5, IO%LCHARGH5 &
++         ,IHOST,PORT,INET &
+ #ifdef libbeef
+          ,LBEEFENS,LBEEFBAS &
+ #endif
+@@ -909,6 +960,7 @@
+       CALL ELPH_CHECK_INPUT_CONSISTENCY(INCAR_F, PHON_SETTINGS, ELPH_SETTINGS, POLAR_DATA)
+ ! solvation__
+       CALL SOL_READER(IO)
++      CALL SOL_VALIDATE_DRIVER(DYN%IBRION)
+ ! solvation__
+ ! bexternal__
+       CALL BEXT_READER(IO%IU0,IO%IU5)
+@@ -949,6 +1001,119 @@
+          CALL vtutor%alert("The following INCAR tags have not been used:\n" // UNUSED_TAGS &
+             // "\nPlease check whether the tags are spelled correctly, have the correct &
+             &format, and do not appear multiple times in the file.")
++
++!-----------------------------------------------------------------------
++! ipi open socket
++!-----------------------------------------------------------------------
++#ifdef MPI
++      IF (DYN%IBRION==23 .OR. DYN%IBRION==24) THEN
++        IF (COMM%NODE_ME == 1) THEN
++          WRITE(TIU0,*) " DRIVER - Connecting to host ", TRIM(IHOST)
++          IF (INET > 0) THEN
++            WRITE(TIU0,*) " on port ", PORT, " using an internet socket."
++          ELSE
++            WRITE(TIU0,*) " using UNIX socket."
++          ENDIF
++          CALL open_socket(SOCKET, INET, PORT, TRIM(IHOST))
++          WRITE(TIU0,*) "VASP ipi driver (written by Wei Fang, extended for IBRION=24) successfully starting"
++        ENDIF
++        ! get initial geometries and, for IBRION=24, initialization parameters from ipi
++      driver_init: DO
++        ! do communication on master node only
++        IF (COMM%NODE_ME == 1) THEN
++          CALL readbuffer(SOCKET, HEADER, MSGLEN)
++          IF (TRIM(HEADER) == "STATUS") THEN
++            IMSG=1
++          ELSE IF (TRIM(HEADER) == "POSDATA") THEN
++            IMSG=2
++          ELSE IF (TRIM(HEADER) == "INIT") THEN
++            IMSG=3
++          ELSE IF (TRIM(HEADER) == "CHGDATA") THEN
++            IMSG=5
++          ELSE
++            IMSG=4
++          ENDIF
++        ENDIF
++        CALL M_bcast_i(COMM,IMSG,1)
++        IF (COMM%NODE_ME == 1) WRITE(TIU0,*) " @ DRIVER MODE: Message from server: ", TRIM(HEADER)
++        IF (IMSG == 1) THEN
++          IF (COMM%NODE_ME == 1) THEN
++            IF (DYN%IBRION==24 .AND. .NOT. INIT_DONE_24) THEN
++              CALL writebuffer(SOCKET, "NEEDINIT    ", MSGLEN)
++            ELSE
++              CALL writebuffer(SOCKET, "READY       ", MSGLEN)
++            ENDIF
++          ENDIF
++        ELSE IF (IMSG == 2) THEN
++          IF (DYN%IBRION==24) THEN
++            IF (.NOT. INIT_DONE_24 .OR. .NOT. IPI_CHGDATA_READY) &
++     &        CALL FAIL_IPI("Constant-potential POSDATA requires INIT and this frame's CHGDATA.")
++            IPI_CHGDATA_READY=.FALSE.
++            IPI_RESULT_VALID=.FALSE.
++            IPI_OBSERVABLES_READY=.FALSE.
++          ENDIF
++          ! receives the positions & the cell data
++          IF (COMM%NODE_ME == 1) THEN    ! first the cell and the number of atoms
++            CALL readbuffer(SOCKET, CELL_H, 9)
++            CALL readbuffer(SOCKET, CELL_IH, 9)
++            CALL readbuffer(SOCKET, NAT)
++          ENDIF
++          ! broadcast to all nodes
++          CALL M_bcast_d(COMM,CELL_H,9)
++          CALL M_bcast_d(COMM,CELL_IH,9)
++          CALL M_bcast_i(COMM,NAT,1)
++          IF (NAT/=T_INFO%NIONS) THEN
++            IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &        WRITE(IO%IU0,*) 'ERROR: i-PI/VASP atom-count mismatch.'
++            CALL FAIL_IPI("Invalid i-PI request or force result.")
++          ENDIF
++          ! convert to vasp LATT_CUR%A & %B format & units conversion
++          DO NI=1,3
++            LATT_CUR%A(NI,1) = CELL_H(NI*3-2)*AUTOA
++            LATT_CUR%A(NI,2) = CELL_H(NI*3-1)*AUTOA
++            LATT_CUR%A(NI,3) = CELL_H(NI*3)*AUTOA
++          ENDDO
++          DO NI=1,3
++            LATT_CUR%B(NI,1) = CELL_IH(NI*3-2)/AUTOA
++            LATT_CUR%B(NI,2) = CELL_IH(NI*3-1)/AUTOA
++            LATT_CUR%B(NI,3) = CELL_IH(NI*3)/AUTOA
++          ENDDO
++          CALL LATTIC(LATT_CUR)
++ 2333     FORMAT(' @DRIVER MODE: Received direct lattice vectors',17X,'reciprocal lattice vectors'/ &
++       &   3(2(3X,3F13.9)/) /)
++          IF (COMM%NODE_ME == 1) THEN
++            WRITE(TIU0,*) " @ DRIVER MODE: Received initial lattice "
++            WRITE(TIU6,2333) ((LATT_CUR%A(I,J),I=1,3),(LATT_CUR%B(I,J),I=1,3),J=1,3)
++          ENDIF
++          ! then we can allocate the buffer for the positions, and receive them
++          ALLOCATE(IPIATOMS(3*NAT))
++          ALLOCATE(IPIFORCES(3*NAT))
++          IF (COMM%NODE_ME == 1) CALL readbuffer(SOCKET, IPIATOMS, NAT*3)
++          CALL M_bcast_d(COMM,IPIATOMS,NAT*3) ! and broadcast them to all nodes
++          ! convert to vasp DYN%POSION format & units conversion
++          DO NI=1,NAT
++            DYN%POSION(1,NI) = IPIATOMS(NI*3-2)*AUTOA
++            DYN%POSION(2,NI) = IPIATOMS(NI*3-1)*AUTOA
++            DYN%POSION(3,NI) = IPIATOMS(NI*3)*AUTOA
++          ENDDO
++          CALL KARDIR(NAT,DYN%POSION,LATT_CUR%B)
++          CALL TOPRIM(NAT,DYN%POSION)
++          DYN%POSIOC=DYN%POSION
++          IF (COMM%NODE_ME == 1) WRITE(TIU0,*) " @ DRIVER MODE: Received initial positions "
++          EXIT driver_init
++        ELSE IF (IMSG == 3 .AND. DYN%IBRION==24) THEN
++          CALL READ_IPI_INIT
++        ELSE IF (IMSG == 5 .AND. DYN%IBRION==24) THEN
++          CALL READ_IPI_CHARGE
++
++        ELSE
++          INFO%LSTOP=.TRUE.
++          IF (COMM%NODE_ME == 1) WRITE(TIU0,*) "EXIT driver or unknow msg received"
++          EXIT driver_init
++        ENDIF
++      ENDDO driver_init
++      ENDIF
++#endif
+ 
+ !-----------------------------------------------------------------------
+ #ifdef _OPENACC
+@@ -3076,6 +3241,14 @@
+ !=======================================================================
+       ion: DO
+       IF (INFO%LSTOP) EXIT ion
++      IF (DYN%IBRION==24) THEN
++        IF (INFO%NELM<=1) &
++     &    CALL FAIL_IPI("IBRION=24 self-consistent SCF requires NELM>1.")
++        IF (.NOT. LDO_AB_INITIO .OR. LJ_ONLY .OR. LCHI) &
++     &    CALL FAIL_IPI("IBRION=24 requires a self-consistent DFT energy and force calculation.")
++        CALL SOL_BEGIN_DRIVER(GRIDC,LATT_CUR)
++        IF (IO%LSOL_WRITE .AND. LDO_SOL) CALL SET_SOL_WRITE
++      ENDIF
+ !=======================================================================
+ 
+ !  reset broyden mixing
+@@ -3140,6 +3313,8 @@
+     ENDIF
+ #endif
+ 
++    IF (DYN%IBRION==24 .AND. .NOT. LDO_AB_INITIO) &
++     & CALL FAIL_IPI("IBRION=24 requires a DFT evaluation for each requested frame.")
+     IF ((.NOT. LJ_ONLY .AND. .NOT. LCHI) .AND. (LDO_AB_INITIO)) THEN
+ 
+       CALL XML_TAG("calculation")
+@@ -3333,7 +3508,7 @@
+           CDIJ,CQIJ,CRHODE,N_MIX_PAW,RHOLM,RHOLM_LAST, &
+           CHDEN,SV,VDW_SET, &
+           LMDIM, IRDMAX, (NSTEP==1 .OR.NSTEP==DYN%NSW).OR.IO%NWRITE>=1, &
+-          DYN%ISIF/=0, DYN%ISIF/=0,.TRUE.,  &
++          DYN%ISIF/=0, DYN%ISIF/=0,.NOT.SOL_IS_FROZEN(),  &
+           XCSIF, EWSIF, TSIF, EWIFOR, TIFOR, PRESS, TOTEN, KPOINTS)
+       ENDIF
+ 
+@@ -3598,7 +3773,7 @@
+       ENDIF
+ 
+       IF (DYN%IBRION==-1 .OR. DYN%IBRION==5 .OR. DYN%IBRION==6 .OR. &
+-           DYN%IBRION==7.OR.DYN%IBRION==8) THEN
++           DYN%IBRION==7.OR.DYN%IBRION==8 .OR. DYN%IBRION==23 .OR. DYN%IBRION==24) THEN
+          IF(LDO_AB_INITIO) THEN
+             EENTROPY=E%EENTROPY*SCALEE
+          ELSE
+@@ -3631,6 +3806,11 @@
+          ENDIF
+ 
+          IF (M_CONSTRAINED()) CALL WRITE_CONSTRAINED_M(17,.TRUE.)
++
++! Make the completed frame visible before waiting for the next socket request.
++         IF (DYN%IBRION==23 .OR. DYN%IBRION==24) THEN
++            IF (IO%LOPEN) CALL WFORCE(17)
++         ENDIF
+ 
+          io_end
+       ENDIF
+@@ -3811,6 +3991,184 @@
+      &   ' F= ',E14.8,' E0= ',E14.8,1X,' EK= ',E11.5, &
+      &   ' SP= ',E8.2,' SK= ',E8.2)
+ 77280 FORMAT(' mag=',3F11.3)
++
++!=======================================================================
++! DYN%IBRION =
++! 23  driver mode for ipi
++!=======================================================================
++#ifdef MPI
++      ELSE IF (DYN%IBRION==23 .OR. DYN%IBRION==24) THEN
++        DYN%POSIOC=DYN%POSION
++        IF (DYN%IBRION==24) THEN
++          CALL SOL_FINISH_DRIVER
++          IPI_RESULT_VALID=.TRUE.
++          IPI_OBSERVABLES_READY=.FALSE.
++        ENDIF
++        HASDATA=.TRUE.
++
++      driver_loop: DO
++        ! do communication on master node only
++        IF (COMM%NODE_ME == 1) THEN
++          CALL readbuffer(SOCKET, HEADER, MSGLEN)
++          IF (TRIM(HEADER) == "STATUS") THEN
++            IMSG=1
++          ELSE IF (TRIM(HEADER) == "POSDATA") THEN
++            IMSG=2
++          ELSE IF (TRIM(HEADER) == "GETFORCE") THEN
++            IMSG=3
++          ELSE IF (TRIM(HEADER) == "INIT") THEN
++            IMSG=6
++          ELSE IF (TRIM(HEADER) == "CHGDATA") THEN
++            IMSG=5
++          ELSE
++            IMSG=4
++          ENDIF
++        ENDIF
++        CALL M_bcast_i(COMM,IMSG,1)
++        IF (COMM%NODE_ME == 1) WRITE(TIU0,*) " @ DRIVER MODE: Message from server: ", TRIM(HEADER)
++        IF (IMSG == 1) THEN
++          IF (COMM%NODE_ME == 1) THEN
++            IF (HASDATA) THEN
++              CALL writebuffer(SOCKET,"HAVEDATA    ",MSGLEN)
++            ELSE
++              CALL writebuffer(SOCKET,"READY       ",MSGLEN)
++            ENDIF
++          ENDIF
++        ELSE IF (IMSG == 2) THEN
++          IF (DYN%IBRION==24) THEN
++            IF (.NOT. INIT_DONE_24 .OR. .NOT. IPI_CHGDATA_READY) &
++     &        CALL FAIL_IPI("Constant-potential POSDATA requires INIT and this frame's CHGDATA.")
++            IPI_CHGDATA_READY=.FALSE.
++            IPI_RESULT_VALID=.FALSE.
++            IPI_OBSERVABLES_READY=.FALSE.
++          ENDIF
++          ! receives cell data
++          IF (COMM%NODE_ME == 1) THEN
++            CALL readbuffer(SOCKET, CELL_H, 9)
++            CALL readbuffer(SOCKET, CELL_IH, 9)
++            CALL readbuffer(SOCKET, NAT)
++          ENDIF
++          ! broadcast to all nodes
++          CALL M_bcast_d(COMM,CELL_H,9)
++          CALL M_bcast_d(COMM,CELL_IH,9)
++          CALL M_bcast_i(COMM,NAT,1)
++          IF (NAT/=T_INFO%NIONS) THEN
++            IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &        WRITE(IO%IU0,*) 'ERROR: i-PI/VASP atom-count mismatch.'
++            CALL FAIL_IPI("Invalid i-PI request or force result.")
++          ENDIF
++          ! convert to vasp LATT_CUR%A & %B format & units conversion
++          DO NI=1,3
++            LATT_CUR%A(NI,1) = CELL_H(NI*3-2)*AUTOA
++            LATT_CUR%A(NI,2) = CELL_H(NI*3-1)*AUTOA
++            LATT_CUR%A(NI,3) = CELL_H(NI*3)*AUTOA
++          ENDDO
++          DO NI=1,3
++            LATT_CUR%B(NI,1) = CELL_IH(NI*3-2)/AUTOA
++            LATT_CUR%B(NI,2) = CELL_IH(NI*3-1)/AUTOA
++            LATT_CUR%B(NI,3) = CELL_IH(NI*3)/AUTOA
++          ENDDO
++          CALL LATTIC(LATT_CUR)
++          IF (COMM%NODE_ME == 1) THEN
++            WRITE(TIU0,*) " @ DRIVER MODE: Received lattice"
++            WRITE(TIU6,2333) ((LATT_CUR%A(I,J),I=1,3),(LATT_CUR%B(I,J),I=1,3),J=1,3)
++          ENDIF
++          ! receives positions
++          IF (COMM%NODE_ME == 1) CALL readbuffer(SOCKET, IPIATOMS, NAT*3)
++          CALL M_bcast_d(COMM,IPIATOMS,NAT*3) ! and broadcast them to all nodes
++          ! convert to vasp DYN%POSION format & units conversion
++          DO NI=1,NAT
++            DYN%POSION(1,NI) = IPIATOMS(NI*3-2)*AUTOA
++            DYN%POSION(2,NI) = IPIATOMS(NI*3-1)*AUTOA
++            DYN%POSION(3,NI) = IPIATOMS(NI*3)*AUTOA
++          ENDDO
++          CALL KARDIR(NAT,DYN%POSION,LATT_CUR%B)
++          CALL TOPRIM(NAT,DYN%POSION)
++          IF (COMM%NODE_ME == 1) write(TIU0,*) " @ DRIVER MODE: Received positions "
++          ! move on to the next DO ion
++          EXIT driver_loop
++        ELSE IF (IMSG == 3) THEN
++          ! communicates energy info back to i-pi
++          IF (DYN%IBRION==24) CALL PREPARE_IPI_OBSERVABLES
++          IF (COMM%NODE_ME == 1) THEN
++            WRITE(TIU0,*) " @ DRIVER MODE: Returning v,forces,stress "
++            IPIPOT = TOTEN*EVTOHA
++            IF (DYN%IBRION==24) IPIPOT = (TOTEN-E%EENTROPY/(2+NORDER))*EVTOHA
++            IF (.NOT. IEEE_IS_FINITE(IPIPOT)) THEN
++              IF (IO%IU0>=0) WRITE(IO%IU0,*) 'ERROR: VASP returned a non-finite energy.'
++              CALL FAIL_IPI("Invalid i-PI request or force result.")
++            ENDIF
++            DO NI=1,NAT
++              IPIFORCES(NI*3-2) = TIFOR(1,NI)*FOCTOAU
++              IPIFORCES(NI*3-1) = TIFOR(2,NI)*FOCTOAU
++              IPIFORCES(NI*3) = TIFOR(3,NI)*FOCTOAU
++              IF (.NOT. IEEE_IS_FINITE(IPIFORCES(NI*3-2)) .OR. &
++     &            .NOT. IEEE_IS_FINITE(IPIFORCES(NI*3-1)) .OR. &
++     &            .NOT. IEEE_IS_FINITE(IPIFORCES(NI*3))) THEN
++                IF (IO%IU0>=0) WRITE(IO%IU0,*) 'ERROR: VASP returned a non-finite force.'
++                CALL FAIL_IPI("Invalid i-PI request or force result.")
++              ENDIF
++            ENDDO
++            DO NI=1,3
++              VIRIAL(NI*3-2) = TSIF(1,NI)*EVTOHA
++              VIRIAL(NI*3-1) = TSIF(2,NI)*EVTOHA
++              VIRIAL(NI*3) = TSIF(3,NI)*EVTOHA
++              IF (.NOT. IEEE_IS_FINITE(VIRIAL(NI*3-2)) .OR. &
++     &            .NOT. IEEE_IS_FINITE(VIRIAL(NI*3-1)) .OR. &
++     &            .NOT. IEEE_IS_FINITE(VIRIAL(NI*3))) THEN
++                IF (IO%IU0>=0) WRITE(IO%IU0,*) 'ERROR: VASP returned a non-finite virial.'
++                CALL FAIL_IPI("Invalid i-PI request or force result.")
++              ENDIF
++            ENDDO
++            CALL writebuffer(SOCKET,"FORCEREADY  ",MSGLEN)
++            CALL writebuffer(SOCKET,IPIPOT)
++            CALL writebuffer(SOCKET,NAT)
++            CALL writebuffer(SOCKET,IPIFORCES,3*NAT)
++            CALL writebuffer(SOCKET,VIRIAL,9)
++            IF (DYN%IBRION==24) THEN
++              ! send JSON extras with Fermi level (eV), electron count, and
++              ! optionally vacuum level / workfunction when a planar-average
++              ! region has been provided by the i-PI driver.
++              IF (POTENTIAL_AVERAGE_MAX_A>POTENTIAL_AVERAGE_MIN_A .AND. IPI_WORKFUNCTION_VALID) THEN
++                WRITE(EXTRAJSON,'(A,ES24.16E3,A,ES24.16E3,A,ES24.16E3,A,ES24.16E3,A)') &
++     &           '{"fermi_level_eV":', IPI_FERMI_EV, ', "nelect":', IPI_NELECT, &
++     &           ', "vacuum_level_eV":', IPI_VAC_LEVEL_EV, ', "workfunction_eV":', IPI_WORKFUNCTION_EV, '}'
++              ELSE
++                WRITE(EXTRAJSON,'(A,ES24.16E3,A,ES24.16E3,A)') &
++     &           '{"fermi_level_eV":', IPI_FERMI_EV, ', "nelect":', IPI_NELECT, '}'
++              ENDIF
++              EXTRALEN = LEN_TRIM(EXTRAJSON)
++              CALL writebuffer(SOCKET,EXTRALEN)
++              CALL writebuffer(SOCKET,EXTRAJSON,EXTRALEN)
++            ELSE
++              ! i-pi can also receive an arbitrary string, we just send back zero characters.
++              CALL writebuffer(SOCKET,0)
++            ENDIF
++          ENDIF
++          HASDATA=.FALSE.
++        ELSE IF (IMSG == 6 .AND. DYN%IBRION==24) THEN
++          CALL READ_IPI_INIT
++        ELSE IF (IMSG == 5) THEN
++          IF (DYN%IBRION==24) THEN
++            CALL READ_IPI_CHARGE
++          ELSE
++            ! Default behaviour: treat CHGDATA as NELECT update
++            IF (COMM%NODE_ME == 1) THEN
++              CALL readbuffer(SOCKET, INFO%NELECT)
++            ENDIF
++            CALL M_bcast_d(COMM,INFO%NELECT,1)
++            IF (COMM%NODE_ME == 1) THEN
++              WRITE(TIU0,*) ' @ DRIVER MODE: Updated NELECT from CHGDATA: ', INFO%NELECT
++            ENDIF
++          ENDIF
++
++        ELSE
++          INFO%LSTOP=.TRUE.
++          IF (COMM%NODE_ME == 1) WRITE(TIU0,*) "EXIT driver or unknow msg received"
++          EXIT driver_loop
++        ENDIF
++      ENDDO driver_loop
++#endif
+ 
+ !=======================================================================
+ ! DYN%IBRION =
+@@ -4186,9 +4544,10 @@
+ !-----------------------------------------------------------------------
+ ! update number of electrons for constant potential calculation
+ !-----------------------------------------------------------------------
+-        INFO%LSTOP = INFO%LSTOP .AND. check_EFERMI(EFERMI)
+-        IF (.NOT. INFO%LSTOP) &
+-           CALL update_NELECT(INFO%NELECT, EFERMI)
++        IF (DYN%IBRION/=24) THEN
++          INFO%LSTOP = INFO%LSTOP .AND. check_EFERMI(EFERMI)
++          IF (.NOT. INFO%LSTOP) CALL update_NELECT(INFO%NELECT, EFERMI)
++        ENDIF
+ !-----------------------------------------------------------------------
+         
+         io_begin
+@@ -4859,7 +5218,7 @@
+ ! comment out the following line to add  exchange correlation
+          IF (IO%LVHAR) CALL SET_LEXCH(-1)
+          ! solvation - write out ionic and bound charges in vaspsol
+-         CALL SET_SOL_WRITE
++         IF (IO%LSOL_WRITE) CALL SET_SOL_WRITE
+          ! solvation - 
+          CALL POTLOK(GRID,GRIDC,GRID_SOFT, WDES%COMM_INTER, WDES, &
+                   INFO,P,T_INFO,E,LATT_CUR, &
+@@ -5348,6 +5707,353 @@
+       CALL vtutor%stopCode()
+ 
+       CONTAINS
++
++      SUBROUTINE FAIL_IPI(MESSAGE)
++      CHARACTER(LEN=*), INTENT(IN) :: MESSAGE
++      CALL vtutor%error(MESSAGE, dont_stop=.TRUE.)
++      CALL vtutor%stopCode(isError)
++      END SUBROUTINE FAIL_IPI
++
++      SUBROUTINE READ_IPI_INIT
++      INTEGER :: INIT_RID, INITLEN, INIT_PARSE_STATUS
++      CHARACTER(LEN=:), ALLOCATABLE :: INITSTR
++      LOGICAL :: FOUND_NELECT, FOUND_NEUTRAL, FOUND_AXIS
++      LOGICAL :: FOUND_AVERAGE_MIN, FOUND_AVERAGE_MAX, TOKEN_OK
++      ! receives initialization string and parses NELECT for constant potential mode
++      IF (COMM%NODE_ME == 1) THEN
++        CALL readbuffer(SOCKET, INIT_RID)
++        CALL readbuffer(SOCKET, INITLEN)
++        INIT_PARSE_STATUS = 1
++        NEUTRAL_ELECTRONS_REF = 0._q
++        POTENTIAL_AVERAGE_AXIS = 0
++        POTENTIAL_AVERAGE_MIN_A = 0._q
++        POTENTIAL_AVERAGE_MAX_A = 0._q
++        FOUND_NELECT = .FALSE.
++        FOUND_NEUTRAL = .FALSE.
++        FOUND_AXIS = .FALSE.
++        FOUND_AVERAGE_MIN = .FALSE.
++        FOUND_AVERAGE_MAX = .FALSE.
++
++        IF (INITLEN<=0) THEN
++          INIT_PARSE_STATUS = 0
++        ELSE
++          ALLOCATE(CHARACTER(LEN=INITLEN) :: INITSTR)
++          CALL readbuffer(SOCKET, INITSTR, INITLEN)
++          CALL PARSE_IPI_REAL_TOKEN(INITSTR,'NELECT',INFO%NELECT,FOUND_NELECT,TOKEN_OK)
++          IF (.NOT. TOKEN_OK) INIT_PARSE_STATUS = 0
++          CALL PARSE_IPI_REAL_TOKEN(INITSTR,'neutral_electrons',NEUTRAL_ELECTRONS_REF,FOUND_NEUTRAL,TOKEN_OK)
++          IF (.NOT. TOKEN_OK) INIT_PARSE_STATUS = 0
++          CALL PARSE_IPI_AXIS_TOKEN(INITSTR,'potential_average_axis', &
++     &             POTENTIAL_AVERAGE_AXIS,FOUND_AXIS,TOKEN_OK)
++          IF (.NOT. TOKEN_OK) INIT_PARSE_STATUS = 0
++          CALL PARSE_IPI_REAL_TOKEN(INITSTR,'potential_average_min_A', &
++     &             POTENTIAL_AVERAGE_MIN_A,FOUND_AVERAGE_MIN,TOKEN_OK)
++          IF (.NOT. TOKEN_OK) INIT_PARSE_STATUS = 0
++          CALL PARSE_IPI_REAL_TOKEN(INITSTR,'potential_average_max_A', &
++     &             POTENTIAL_AVERAGE_MAX_A,FOUND_AVERAGE_MAX,TOKEN_OK)
++          IF (.NOT. TOKEN_OK) INIT_PARSE_STATUS = 0
++          IF (INDEX(INITSTR,'solvation_update_stride')>0) THEN
++            WRITE(TIU0,*) 'ERROR: INIT solvation_update_stride has been removed.'
++            INIT_PARSE_STATUS = 0
++          ENDIF
++          DEALLOCATE(INITSTR)
++        ENDIF
++
++        IF (.NOT. FOUND_NELECT .OR. INFO%NELECT<=0._q) INIT_PARSE_STATUS = 0
++        IF (FOUND_NEUTRAL .AND. NEUTRAL_ELECTRONS_REF<=0._q) INIT_PARSE_STATUS = 0
++        IF ((FOUND_AXIS .NEQV. FOUND_AVERAGE_MIN) .OR. &
++     &          (FOUND_AXIS .NEQV. FOUND_AVERAGE_MAX)) INIT_PARSE_STATUS = 0
++        IF (FOUND_AXIS .AND. (POTENTIAL_AVERAGE_AXIS<1 .OR. POTENTIAL_AVERAGE_AXIS>3)) &
++     &          INIT_PARSE_STATUS = 0
++        IF (FOUND_AVERAGE_MIN .AND. POTENTIAL_AVERAGE_MAX_A<=POTENTIAL_AVERAGE_MIN_A) &
++     &          INIT_PARSE_STATUS = 0
++        IF (INIT_PARSE_STATUS==1) THEN
++          WRITE(TIU0,*) ' @ DRIVER MODE: Parsed NELECT from INIT for IBRION=24: ', INFO%NELECT
++          IF (FOUND_NEUTRAL) &
++     &          WRITE(TIU0,*) ' @ DRIVER MODE: Parsed neutral_electrons from INIT: ', NEUTRAL_ELECTRONS_REF
++          IF (FOUND_AXIS) &
++     &          WRITE(TIU0,*) ' @ DRIVER MODE: Parsed potential average axis/region: ', &
++     &          POTENTIAL_AVERAGE_AXIS, POTENTIAL_AVERAGE_MIN_A, POTENTIAL_AVERAGE_MAX_A
++        ENDIF
++      ENDIF
++      CALL M_bcast_i(COMM,INIT_PARSE_STATUS,1)
++      IF (INIT_PARSE_STATUS/=1) THEN
++        IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &        WRITE(IO%IU0,*) 'ERROR: Malformed or incomplete constant-potential INIT payload.'
++        CALL FAIL_IPI("Invalid i-PI request or force result.")
++      ENDIF
++      CALL M_bcast_d(COMM,INFO%NELECT,1)
++      CALL M_bcast_d(COMM,NEUTRAL_ELECTRONS_REF,1)
++      CALL M_bcast_i(COMM,POTENTIAL_AVERAGE_AXIS,1)
++      CALL M_bcast_d(COMM,POTENTIAL_AVERAGE_MIN_A,1)
++      CALL M_bcast_d(COMM,POTENTIAL_AVERAGE_MAX_A,1)
++
++      IF (COMM%NODE_ME == 1) &
++     &      WRITE(TIU0,*) ' @ DRIVER MODE: VASPsol switches LSOL/LSOL_SCF: ', LSOL, LSOL_SCF
++      CALL SOL_RESET_DRIVER
++      INIT_DONE_24 = .TRUE.
++      HASDATA=.FALSE.
++      IPI_CHGDATA_READY=.FALSE.
++      IPI_RESULT_VALID=.FALSE.
++      IPI_OBSERVABLES_READY=.FALSE.
++      END SUBROUTINE READ_IPI_INIT
++
++      SUBROUTINE READ_IPI_CHARGE
++      INTEGER :: IPI_MODE_FLAGS, NE_DOPING_FLAG, N_NE_ATOMS, NT
++      REAL(q) :: DELTA_NELECT, ZVAL_NE_CURRENT
++      IF (.NOT. INIT_DONE_24) CALL FAIL_IPI("CHGDATA requires constant-potential INIT.")
++      ! IBRION=24 CHGDATA always carries target total NELECT plus an
++      ! int32 mode_flags bitmask.
++      IF (COMM%NODE_ME == 1) THEN
++        CALL readbuffer(SOCKET, INFO%NELECT)
++        CALL readbuffer(SOCKET, IPI_MODE_FLAGS)
++      ENDIF
++      CALL M_bcast_d(COMM,INFO%NELECT,1)
++      CALL M_bcast_i(COMM, IPI_MODE_FLAGS, 1)
++
++      IF (IPI_MODE_FLAGS/=0 .AND. IPI_MODE_FLAGS/=2) THEN
++        IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) THEN
++          WRITE(IO%IU0,*) 'ERROR: Unsupported i-PI CHGDATA mode_flags value: ', IPI_MODE_FLAGS
++        ENDIF
++        CALL FAIL_IPI("Invalid i-PI request or force result.")
++      ENDIF
++      IF (.NOT. IEEE_IS_FINITE(INFO%NELECT) .OR. INFO%NELECT<=0._q) THEN
++        IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &          WRITE(IO%IU0,*) 'ERROR: CHGDATA requires a finite positive electron number.'
++        CALL FAIL_IPI("Invalid i-PI request or force result.")
++      ENDIF
++
++      NE_DOPING_FLAG = IAND(IPI_MODE_FLAGS,2)
++      IF (NE_DOPING_FLAG/=0) THEN
++        IF (NEUTRAL_ELECTRONS_REF<=0._q) THEN
++          IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) THEN
++            WRITE(IO%IU0,*) 'ERROR: Ne-electrode CHGDATA requires neutral_electrons from INIT.'
++          ENDIF
++          CALL FAIL_IPI("Invalid i-PI request or force result.")
++        ENDIF
++        IF (NE_SPECIES_TYPE<=0) THEN
++          DO NT=1,T_INFO%NTYP
++            IF (TRIM(ADJUSTL(P(NT)%ELEMENT))=='Ne' .OR. TRIM(ADJUSTL(P(NT)%ELEMENT))=='NE') THEN
++              NE_SPECIES_TYPE = NT
++              EXIT
++            ENDIF
++          ENDDO
++        ENDIF
++        IF (NE_SPECIES_TYPE<=0) THEN
++          IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) THEN
++            WRITE(IO%IU0,*) 'ERROR: Ne-electrode CHGDATA requested but no Ne species was found in POTCAR.'
++          ENDIF
++          CALL FAIL_IPI("Invalid i-PI request or force result.")
++        ENDIF
++        N_NE_ATOMS = T_INFO%NITYP(NE_SPECIES_TYPE)
++        IF (N_NE_ATOMS<=0) THEN
++          IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) THEN
++            WRITE(IO%IU0,*) 'ERROR: Ne-electrode CHGDATA requested but no Ne ions are present in POSCAR.'
++          ENDIF
++          CALL FAIL_IPI("Invalid i-PI request or force result.")
++        ENDIF
++
++        DELTA_NELECT = INFO%NELECT - NEUTRAL_ELECTRONS_REF
++        ZVAL_NE_CURRENT = P(NE_SPECIES_TYPE)%ZVALF_ORIG + &
++     &                          DELTA_NELECT/REAL(N_NE_ATOMS,q)
++        P(NE_SPECIES_TYPE)%ZVALF      = ZVAL_NE_CURRENT
++        CALL SOL_UPDATE_ZVSUM(T_INFO,P)
++        NE_DOPING_MODE = .TRUE.
++
++        IF (COMM%NODE_ME == 1) THEN
++          WRITE(TIU0,*) ' @ DRIVER MODE: Ne-electrode CHGDATA target NELECT = ', INFO%NELECT, &
++     &                         ', neutral_electrons = ', NEUTRAL_ELECTRONS_REF
++          WRITE(TIU0,*) ' @ DRIVER MODE: Ne atoms = ', N_NE_ATOMS, &
++     &                         ', Ne ZVALF = ', ZVAL_NE_CURRENT
++        ENDIF
++      ELSE
++        IF (NE_DOPING_MODE) THEN
++          IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &            WRITE(IO%IU0,*) 'ERROR: Cannot disable Ne-electrode mode after it has started.'
++          CALL FAIL_IPI("Invalid i-PI request or force result.")
++        ENDIF
++        IF (COMM%NODE_ME == 1) &
++     &          WRITE(TIU0,*) ' @ DRIVER MODE: Updated NELECT from CHGDATA: ', INFO%NELECT
++      ENDIF
++      IPI_CHGDATA_READY=.TRUE.
++      IPI_RESULT_VALID=.FALSE.
++      IPI_OBSERVABLES_READY=.FALSE.
++      HASDATA=.FALSE.
++      END SUBROUTINE READ_IPI_CHARGE
++
++      SUBROUTINE PREPARE_IPI_OBSERVABLES
++      LOGICAL :: LIPI_POTENTIAL_AVERAGE, LIPI_HARTREE_ONLY
++      LOGICAL :: LDO_SOL_SAVE, LCOR_DIP_SAVE
++      TYPE(energy) :: IPI_ENERGY_SAVE
++      REAL(q) :: VAC_LEVEL_EV, WORKFUNCTION_EV
++      IF (.NOT. IPI_RESULT_VALID) CALL FAIL_IPI("GETFORCE requires a completed constant-potential SCF.")
++      IF (IPI_OBSERVABLES_READY) RETURN
++      LIPI_POTENTIAL_AVERAGE = (POTENTIAL_AVERAGE_MAX_A>POTENTIAL_AVERAGE_MIN_A)
++      LIPI_HARTREE_ONLY = (IO%LVHAR .OR. LIPI_POTENTIAL_AVERAGE)
++      IF (IO%LVTOT.OR.IO%LVHAR .OR. LIPI_POTENTIAL_AVERAGE) THEN
++#ifdef MPI
++        IF (WDES%COMM_KINTER%NODE_ME.EQ.1) THEN
++#endif
++          IF (LIPI_HARTREE_ONLY) THEN
++            CALL PUSH_LEXCH(-1)
++          ENDIF
++          IPI_ENERGY_SAVE = E
++          LDO_SOL_SAVE = LDO_SOL
++          ! Output uses the converged solvent state and cannot refresh it.
++          LDO_SOL = .FALSE.
++          CALL POTLOK(GRID,GRIDC,GRID_SOFT, WDES%COMM_INTER, WDES, &
++     &                     INFO,P,T_INFO,E,LATT_CUR, &
++     &                     CHTOT,CSTRF,CVTOT,DENCOR,SV, SOFT_TO_C,XCSIF)
++
++          IF (.NOT. LIPI_HARTREE_ONLY) THEN
++            CALL POTLOK_METAGGA(KINEDEN, &
++     &                   GRID,GRIDC,GRID_SOFT,WDES%COMM_INTER,WDES,INFO,P,T_INFO,E,LATT_CUR, &
++     &                   CHDEN,CHTOT,DENCOR,CVTOT,SV,HAMILTONIAN%MUTOT,HAMILTONIAN%MU,SOFT_TO_C,XCSIF)
++          ENDIF
++
++          IF (LIPI_HARTREE_ONLY) THEN
++            CALL POP_LEXCH
++          ENDIF
++
++          IF ( DIP%IDIPCO >0 ) THEN
++            LCOR_DIP_SAVE = DIP%LCOR_DIP
++            DIP%LCOR_DIP=.FALSE.
++            CALL CDIPOL_CHTOT_REC(GRIDC, LATT_CUR,P,T_INFO, &
++     &                CHTOT,CSTRF,CVTOT, WDES%NCDIJ, INFO%NELECT, E%PSCENC )
++            DIP%LCOR_DIP = LCOR_DIP_SAVE
++
++            CALL WRITE_VACUUM_LEVEL(IO%IU6)
++          ENDIF
++
++!               Use the current electrostatic potential for every configuration.
++          IF (LIPI_POTENTIAL_AVERAGE) THEN
++            CALL POTENTIAL_AVERAGE_FROM_CVTOT(GRIDC, LATT_CUR, CVTOT, &
++     &                 POTENTIAL_AVERAGE_AXIS, POTENTIAL_AVERAGE_MIN_A, &
++     &                 POTENTIAL_AVERAGE_MAX_A, VAC_LEVEL_EV)
++          ENDIF
++          E = IPI_ENERGY_SAVE
++          LDO_SOL = LDO_SOL_SAVE
++#ifdef MPI
++        ENDIF
++#endif
++      ENDIF
++      IF (.NOT. IEEE_IS_FINITE(EFERMI)) THEN
++        IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &          WRITE(IO%IU0,*) 'ERROR: VASP returned a non-finite Fermi level.'
++        CALL FAIL_IPI("Invalid i-PI request or force result.")
++      ENDIF
++      IF (.NOT. IEEE_IS_FINITE(INFO%NELECT) .OR. INFO%NELECT<=0._q) THEN
++        IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++     &          WRITE(IO%IU0,*) 'ERROR: VASP returned an invalid electron number.'
++        CALL FAIL_IPI("Invalid i-PI request or force result.")
++      ENDIF
++      IPI_FERMI_EV = EFERMI
++      IPI_NELECT   = INFO%NELECT
++      IF (POTENTIAL_AVERAGE_MAX_A>POTENTIAL_AVERAGE_MIN_A) THEN
++#ifdef MPI
++        CALL M_bcast_d(COMM,VAC_LEVEL_EV,1)
++#endif
++        IF (.NOT. IEEE_IS_FINITE(VAC_LEVEL_EV)) THEN
++          IF (COMM%NODE_ME == 1 .AND. IO%IU0>=0) &
++   &              WRITE(IO%IU0,*) 'ERROR: VASP returned a non-finite vacuum level.'
++          CALL FAIL_IPI("Invalid i-PI request or force result.")
++        ENDIF
++        IPI_VAC_LEVEL_EV = VAC_LEVEL_EV
++        IPI_WORKFUNCTION_VALID = .TRUE.
++        WORKFUNCTION_EV = IPI_VAC_LEVEL_EV - IPI_FERMI_EV
++        IPI_WORKFUNCTION_EV = WORKFUNCTION_EV
++      ENDIF
++      IPI_OBSERVABLES_READY=.TRUE.
++      END SUBROUTINE PREPARE_IPI_OBSERVABLES
++
++      SUBROUTINE PARSE_IPI_REAL_TOKEN(INPUT_STRING,TOKEN,VALUE,FOUND,OK)
++      CHARACTER(LEN=*), INTENT(IN) :: INPUT_STRING, TOKEN
++      REAL(q), INTENT(OUT) :: VALUE
++      LOGICAL, INTENT(OUT) :: FOUND, OK
++      INTEGER :: TOKEN_POS, COLON_POS, START_POS, END_POS, IOS
++
++      VALUE = 0._q
++      FOUND = .FALSE.
++      OK = .TRUE.
++      TOKEN_POS = INDEX(INPUT_STRING,TRIM(TOKEN))
++      IF (TOKEN_POS<=0) RETURN
++
++      COLON_POS = INDEX(INPUT_STRING(TOKEN_POS:),':')
++      IF (COLON_POS<=0) THEN
++        OK = .FALSE.
++        RETURN
++      ENDIF
++      START_POS = TOKEN_POS + COLON_POS
++      DO WHILE (START_POS<=LEN_TRIM(INPUT_STRING))
++        IF (INPUT_STRING(START_POS:START_POS)/=' ' .AND. &
++     &      INPUT_STRING(START_POS:START_POS)/=',' .AND. &
++     &      INPUT_STRING(START_POS:START_POS)/=';') EXIT
++        START_POS = START_POS + 1
++      ENDDO
++      IF (START_POS>LEN_TRIM(INPUT_STRING)) THEN
++        OK = .FALSE.
++        RETURN
++      ENDIF
++
++      END_POS = START_POS
++      DO WHILE (END_POS<=LEN_TRIM(INPUT_STRING))
++        IF (INPUT_STRING(END_POS:END_POS)==',' .OR. &
++     &      INPUT_STRING(END_POS:END_POS)==';') EXIT
++        END_POS = END_POS + 1
++      ENDDO
++      READ(INPUT_STRING(START_POS:END_POS-1),*,IOSTAT=IOS) VALUE
++      IF (IOS/=0) THEN
++        OK = .FALSE.
++        RETURN
++      ENDIF
++      IF (.NOT. IEEE_IS_FINITE(VALUE)) THEN
++        OK = .FALSE.
++        RETURN
++      ENDIF
++      FOUND = .TRUE.
++      END SUBROUTINE PARSE_IPI_REAL_TOKEN
++
++      SUBROUTINE PARSE_IPI_AXIS_TOKEN(INPUT_STRING,TOKEN,AXIS,FOUND,OK)
++      CHARACTER(LEN=*), INTENT(IN) :: INPUT_STRING, TOKEN
++      INTEGER, INTENT(OUT) :: AXIS
++      LOGICAL, INTENT(OUT) :: FOUND, OK
++      INTEGER :: TOKEN_POS, COLON_POS, START_POS
++
++      FOUND = .FALSE.
++      OK = .TRUE.
++      AXIS = 0
++      TOKEN_POS = INDEX(INPUT_STRING,TRIM(TOKEN))
++      IF (TOKEN_POS<=0) RETURN
++      COLON_POS = INDEX(INPUT_STRING(TOKEN_POS:),':')
++      IF (COLON_POS<=0) THEN
++        OK = .FALSE.
++        RETURN
++      ENDIF
++      START_POS = TOKEN_POS + COLON_POS
++      DO WHILE (START_POS<=LEN_TRIM(INPUT_STRING))
++        IF (INPUT_STRING(START_POS:START_POS)/=' ' .AND. &
++     &      INPUT_STRING(START_POS:START_POS)/=',' .AND. &
++     &      INPUT_STRING(START_POS:START_POS)/=';') EXIT
++        START_POS = START_POS + 1
++      ENDDO
++      IF (START_POS>LEN_TRIM(INPUT_STRING)) THEN
++        OK = .FALSE.
++        RETURN
++      ENDIF
++      SELECT CASE (INPUT_STRING(START_POS:START_POS))
++      CASE ('x','X')
++        AXIS = 1
++      CASE ('y','Y')
++        AXIS = 2
++      CASE ('z','Z')
++        AXIS = 3
++      CASE DEFAULT
++        OK = .FALSE.
++        RETURN
++      END SELECT
++      FOUND = .TRUE.
++      END SUBROUTINE PARSE_IPI_AXIS_TOKEN
++
+ 
+ !**********************************************************************
+ !
+@@ -5430,6 +6136,10 @@
+          ENDIF
+       ENDIF
+       
++      IF (DYN%IBRION==24 .AND. INFO%LSOFT) &
++     &  CALL FAIL_IPI("Constant-potential SCF was interrupted before convergence.")
++      IF (DYN%IBRION==24 .AND. INFO%LABORT) &
++     &  CALL FAIL_IPI("Constant-potential SCF did not reach EDIFF before NELM.")
+       IF (INFO%LABORT) THEN
+           ! we don't stop here, because we still want to do some cleanup
+           CALL vtutor%alert("The electronic self-consistency was not achieved in &
+diff --git a/src/makefile b/src/makefile
+--- a/src/makefile
++++ b/src/makefile
+@@ -112,7 +112,7 @@
+ 
+ OBJCTS=$(filter %.o, $(OBJS) $(FFT3D))
+ #OBJCTS_f90=$(filter-out getshmem.o, $(OBJCTS))
+-F90SRC=$(OBJCTS:.o=$(SUFFIX))
++F90SRC=$(filter-out sockets.f90,$(OBJCTS:.o=$(SUFFIX)))
+ F90SRC+=main.f90
+ 
+ ifdef MODS
+@@ -134,7 +134,7 @@
+ objects: sources $(LIB) $(OBJS) $(FFT3D) $(INC) main.o
+ 
+ sources:
+-	rsync -u $(SRCDIR)/*.F $(SRCDIR)/*.inc .
++	rsync -u $(SRCDIR)/*.F $(SRCDIR)/*.inc $(SRCDIR)/*.f90 $(SRCDIR)/*.c .
+ #	-rsync -u $(SRCDIR)/*.f .
+ 
+ libs: $(LIB)
+@@ -216,3 +216,6 @@
+ 
+ fft3dlib_f77.o: fft3dlib_f77$(SUFFIX)
+ 	$(F77) $(FFLAGS_F77) -c $*$(SUFFIX)
++
++sockets.o: sockets.c
++	$(CC_LIB) -c sockets.c
+diff --git a/src/pot.F b/src/pot.F
+--- a/src/pot.F
++++ b/src/pot.F
+@@ -401,7 +401,7 @@
+ !-----------------------------------------------------------------------
+ ! add the dielectric corrections to CVTOT and the energy
+ !-----------------------------------------------------------------------
+-      CALL SOL_Vcorrection(CHTOT, DENCOR, CVHAR)
++      CALL SOL_Vcorrection(CHTOT, DENCOR, CVHAR, CWORK(:,1))
+       DO I=1,GRIDC%RC%NP
+          CVTOT(I,1)=CVTOT(I,1)+CVHAR(I)+V_corr(I)
+       ENDDO
+diff --git a/src/reader.F b/src/reader.F
+--- a/src/reader.F
++++ b/src/reader.F
+@@ -13,7 +13,7 @@
+      &        PSTRESS,NDAV, &
+      &        SIGMA,LTET,WEIMIN,EBREAK,DEPER,NWRITE,LCORR, &
+      &        IDIOT,NIONS,NTYPP,lmusic,LOPTICS,STM, &
+-     &        ISPIN,ATOMOM,NIOND,LWAVE,LDOWNSAMPLE,LCHARG,LVTOT,LVHAR,SZPREC, &
++     &        ISPIN,ATOMOM,NIOND,LWAVE,LDOWNSAMPLE,LCHARG,LVTOT,LVHAR,LSOL_WRITE,SZPREC, &
+      &        ENAUG,LORBIT,LELF,ROPT,ENINI, &
+      &        NGX,NGY,NGZ,NGXF,NGYF,NGZF,NBANDS,NBANDSLOW,NBANDSHIGH,NEDOS,NBLK,LATT_CUR, &
+      &        LPLANE_WISE,LCOMPAT,LMAX_CALC,LMAX_MIX,NSIM,LPARD,LPAW,LADDGRID, &
+@@ -22,6 +22,7 @@
+      &        LASPH,TURBO,IRESTART,NREBOOT,NMIN,EREF, &
+      &        NLSPLINE,FFTW_PLAN_EFFORT, &
+      &        LH5,LWAVEH5,LCHARGH5 &
++     &       ,IHOST,PORT,INET &
+ #ifdef libbeef
+      &       ,LBEEFENS,LBEEFBAS &
+ #endif
+@@ -60,7 +61,7 @@
+       CHARACTER (40)   SZNAM
+       CHARACTER (12)   SZPREC
+       LOGICAL   LDUM,MIXFIRST,LFOUND,LDIAG,LSUBROT,LREAL,LREALD,LPDENS,LTET,LOPTICS, &
+-     &          LCORR,LOPEN,lmusic,LWAVE,LDOWNSAMPLE,LCHARG,LVTOT,LVHAR, &
++     &          LCORR,LOPEN,lmusic,LWAVE,LDOWNSAMPLE,LCHARG,LVTOT,LVHAR,LSOL_WRITE, &
+      &          LORBIT_,LELF,LCOMPAT,LPARD,LPAW,LADDGRID, &
+      &          LNONCOLLINEAR,LSORBIT,LMETAGGA, &
+      &          LBEEFENS,LBEEFBAS, &
+@@ -79,6 +80,9 @@
+       LOGICAL   LGAMMA
+       LOGICAL   LKBLOWUP
+       LOGICAL   NLSPLINE
++! ipi port, socket type, host
++      INTEGER   PORT, INET
++      CHARACTER(1024) IHOST
+ !-MM- Spin spiral stuff      
+       LOGICAL   LSPIRAL,LZEROZ
+       REAL(q)   QSPIRAL(3)
+@@ -352,12 +356,16 @@
+ ! number of ionic steps, calculate stresses? (default NSW=0, ISIF=2):
+       NSW=0
+       IF (IBRION==5 .OR. IBRION==6 .OR. IBRION==7 .OR. IBRION==8) NSW=1
++      IF (IBRION==23) NSW=100000 ! default large steps for ipi driver
++      IF (IBRION==24) NSW=1000000
+       CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'NSW', NSW, IERR, WRITEXMLINCAR)
+ ! IBRION is 'useless' if NSW=0, set this flag to -1 in this case ...
+       IF (NSW==0) IBRION=-1
+       ISIF=2
+       ! if MD is selected dont calculate stress
+       IF (IBRION==0) ISIF=0
++      ! ipi driver mode default calculate stress and allow cell to change
++      IF (IBRION==23) ISIF=3
+       CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'ISIF', ISIF, IERR, WRITEXMLINCAR)
+ ! prediction of wavefunction:
+       IWAVPR=0
+@@ -370,6 +378,9 @@
+ #endif
+ ! relaxation: IWAVPR=1
+       IF (IBRION>0) IWAVPR=1
++      ! ipi driver mode default wavefunction extrapolation same as relaxation
++      IF (IBRION==23) IWAVPR=1
++      IF (IBRION==24) IWAVPR=2
+       CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'IWAVPR', IWAVPR, IERR, WRITEXMLINCAR)
+ 
+       IF (IWAVPR==10) THEN
+@@ -383,9 +394,24 @@
+ #ifdef MPI
+       IWAVPR=MOD(IWAVPR,10)+10
+ #endif
++      
++! read ipi host & port 
++      IF (IBRION==23 .OR. IBRION==24) THEN
++        IHOST='localhost'
++        CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'IHOST', IHOST, LEN(IHOST), IERR, WRITEXMLINCAR)
++        CALL STRIP(IHOST,N,'A')
++
++        PORT=23330
++        CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'PORT', PORT, IERR, WRITEXMLINCAR)
++
++        INET=1
++        CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'INET', INET, IERR, WRITEXMLINCAR)
++      ENDIF
+ 
+ ! switch on symmetry (default ISYM=1):
+       ISYM=1 ; IF (LPAW) ISYM=2
++      IF (IBRION==23) ISYM=0 ! default no symm for ipi driver mode
++      IF (IBRION==24) ISYM=0
+       CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'ISYM', ISYM, IERR, WRITEXMLINCAR)
+ 
+ ! for reasons of safety (crazy user are present all over the world):
+@@ -725,6 +751,10 @@
+       ! if one request the Hartree potential LVHAR supercedes the LVTOT
+       IF (LVHAR) LVTOT=.FALSE.
+ 
++! solvent grid output is independent of the electronic feedback
++      LSOL_WRITE=(LVTOT.OR.LVHAR)
++      CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'LSOL_WRITE', LSOL_WRITE, IERR, WRITEXMLINCAR)
++
+ ! read in flag LORBIT
+       LORBIT_=.FALSE.
+       LORBIT=0
+diff --git a/src/sockets.c b/src/sockets.c
+new file mode 100644
+--- /dev/null
++++ b/src/sockets.c
+@@ -0,0 +1,155 @@
++/* A minimal wrapper for socket communication.
++
++Copyright (C) 2013, Joshua More and Michele Ceriotti
++
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of this software and associated documentation files (the
++"Software"), to deal in the Software without restriction, including
++without limitation the rights to use, copy, modify, merge, publish,
++distribute, sublicense, and/or sell copies of the Software, and to
++permit persons to whom the Software is furnished to do so, subject to
++the following conditions:
++
++The above copyright notice and this permission notice shall be included
++in all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++
++Contains both the functions that transmit data to the socket and read the data
++back out again once finished, and the function which opens the socket initially.
++Can be linked to a FORTRAN code that does not support sockets natively.
++
++Functions:
++   error: Prints an error message and then exits.
++   open_socket_: Opens a socket with the required host server, socket type and
++      port number.
++   write_buffer_: Writes a string to the socket.
++   read_buffer_: Reads data from the socket.
++*/
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <sys/un.h>
++#include <netdb.h>
++
++void open_socket(int *psockfd, int* inet, int* port, const char* host)
++/* Opens a socket.
++
++Note that fortran passes an extra argument for the string length, but this is
++ignored here for C compatibility.
++
++Args:
++   psockfd: The id of the socket that will be created.
++   inet: An integer that determines whether the socket will be an inet or unix
++      domain socket. Gives unix if 0, inet otherwise.
++   port: The port number for the socket to be created. Low numbers are often
++      reserved for important channels, so use of numbers of 4 or more digits is
++      recommended.
++   host: The name of the host server.
++*/
++
++{
++   int sockfd, ai_err;
++
++   if (*inet>0)
++   {  // creates an internet socket
++      
++      // fetches information on the host      
++      struct addrinfo hints, *res;  
++      char service[256];
++   
++      memset(&hints, 0, sizeof(hints));
++      hints.ai_socktype = SOCK_STREAM;
++      hints.ai_family = AF_INET;
++      hints.ai_flags = AI_PASSIVE;
++
++      sprintf(service,"%d",*port); // convert the port number to a string
++      ai_err = getaddrinfo(host, service, &hints, &res); 
++      if (ai_err!=0) { perror("Error fetching host data. Wrong host name?"); exit(-1); }
++
++      // creates socket
++      sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
++      if (sockfd < 0) { perror("Error opening socket"); exit(-1); }
++    
++      // makes connection
++      if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) 
++      { perror("Error opening INET socket: wrong port or server unreachable"); exit(-1); }
++      freeaddrinfo(res);
++   }
++   else
++   {  
++      struct sockaddr_un serv_addr;
++
++      // fills up details of the socket addres
++      memset(&serv_addr, 0, sizeof(serv_addr));
++      serv_addr.sun_family = AF_UNIX;
++      strcpy(serv_addr.sun_path, "/tmp/ipi_");
++      strcpy(serv_addr.sun_path+9, host);
++      // creates a unix socket
++  
++      // creates the socket
++      sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
++
++      // connects
++      if (connect(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) 
++      { perror("Error opening UNIX socket: path unavailable, or already existing"); exit(-1); }
++   }
++
++
++   *psockfd=sockfd;
++}
++
++void writebuffer(int *psockfd, const char *data, int* plen)
++/* Writes to a socket.
++
++Args:
++   psockfd: The id of the socket that will be written to.
++   data: The data to be written to the socket.
++   plen: The length of the data in bytes.
++*/
++
++{
++   int n;
++   int sockfd=*psockfd;
++   int len=*plen;
++
++   n = write(sockfd,data,len);
++   if (n < 0) { perror("Error writing to socket: server has quit or connection broke"); exit(-1); }
++}
++
++
++void readbuffer(int *psockfd, char *data, int* plen)
++/* Reads from a socket.
++
++Args:
++   psockfd: The id of the socket that will be read from.
++   data: The storage array for data read from the socket.
++   plen: The length of the data in bytes.
++*/
++
++{
++   int n, nr;
++   int sockfd=*psockfd;
++   int len=*plen;
++
++   n = nr = read(sockfd,data,len);
++
++   while (nr>0 && n<len )
++   {  nr=read(sockfd,&data[n],len-n); n+=nr; }
++
++   if (n == 0) { perror("Error reading from socket: server has quit or connection broke"); exit(-1); }
++}
++
++
+diff --git a/src/solvation.F b/src/solvation.F
+--- a/src/solvation.F
++++ b/src/solvation.F
+@@ -3137,6 +3137,7 @@
+  
+  USE prec
+  USE base
++ USE tutor, ONLY : vtutor, isError
+  USE constant
+  USE mpimy
+  USE mgrid,   ONLY : grid_3d
+@@ -3154,12 +3155,25 @@
+ 
+  PRIVATE
+  
+- PUBLIC :: SOL_READER, SOL_INIT, SOL_WRITER, XML_WRITE_SOL, LDO_SOL
++ PUBLIC :: SOL_READER, SOL_INIT, SOL_WRITER, XML_WRITE_SOL, LDO_SOL, LSOL, LSOL_SCF
+  PUBLIC :: SOL_VCORRECTION, SET_RMS_SCF, SET_SOL_WRITE, update_NELECT, check_EFERMI, L_const_pot
+  PUBLIC :: Ecorr_sol, V_corr, n_solv
++ PUBLIC :: SOL_UPDATE, SOL_RESET_DRIVER, SOL_BEGIN_DRIVER, SOL_FINISH_DRIVER, SOL_VALIDATE_DRIVER
++ PUBLIC :: SOL_IS_FROZEN, SOL_UPDATE_ZVSUM
+  
+  SAVE
+  
++ INTEGER :: SOL_UPDATE = 1
++ INTEGER :: SOL_PHASE = 0
++ INTEGER :: SOL_EVALUATIONS = 0
++ INTEGER :: SOL_GRID_SHAPE(4) = 0
++ REAL(q) :: SOL_CELL(3,3) = 0._q
++ REAL(q) :: SOL_ECORR_BASE = 0._q
++ REAL(q) :: SOL_ION_ENERGY_REF = 0._q
++ LOGICAL :: SOL_CACHE_VALID = .FALSE.
++ LOGICAL :: SOL_REFRESH = .TRUE.
++ LOGICAL :: SOL_PENDING = .FALSE.
++
+  INTEGER :: PK_counter = 0
+  
+  INTEGER :: IU0, IU6
+@@ -3189,19 +3203,86 @@
+  
+ CONTAINS
+ 
++! The frozen solvent is an external field: keep its net force on the ions.
++LOGICAL FUNCTION SOL_IS_FROZEN()
++ SOL_IS_FROZEN = LSOL .AND. SOL_UPDATE>1 .AND. SOL_PENDING .AND. &
++                 SOL_CACHE_VALID .AND. .NOT.SOL_REFRESH
++END FUNCTION SOL_IS_FROZEN
++
++! Keep the solvent net charge consistent with the current ionic valences.
++SUBROUTINE SOL_UPDATE_ZVSUM(T_INFO, P)
++ USE pseudo, ONLY : potcar
++ TYPE(type_info), INTENT(IN) :: T_INFO
++ TYPE(potcar), INTENT(IN) :: P(T_INFO%NTYP)
++ INTEGER :: NT
++ ZVSUM = 0._q
++ DO NT = 1,T_INFO%NTYP
++   ZVSUM = ZVSUM + P(NT)%ZVALF * T_INFO%NITYP(NT) * T_INFO%VCA(NT)
++ ENDDO
++ ! The updated ions start a new SCF problem, with no previous residual.
++ rms_SCF = 0._q
++END SUBROUTINE SOL_UPDATE_ZVSUM
++
++! One local phase per completed POSDATA evaluation, independent of CHGDATA.
++SUBROUTINE SOL_RESET_DRIVER
++ SOL_PHASE = 0
++ SOL_EVALUATIONS = 0
++ SOL_CACHE_VALID = .FALSE.
++ SOL_PENDING = .FALSE.
++END SUBROUTINE SOL_RESET_DRIVER
++
++SUBROUTINE SOL_VALIDATE_DRIVER(IBRION)
++ INTEGER, INTENT(IN) :: IBRION
++ IF (SOL_UPDATE > 1) THEN
++   IF (IBRION /= 24 .OR. .NOT.LSOL .OR. .NOT.LSOL_SCF) THEN
++     IF (IU0>=0) WRITE(IU0,*) 'ERROR: SOL_UPDATE>1 requires IBRION=24, LSOL and LSOL_SCF.'
++     CALL vtutor%stopCode(isError)
++   ENDIF
++ ENDIF
++END SUBROUTINE SOL_VALIDATE_DRIVER
++
++SUBROUTINE SOL_BEGIN_DRIVER(GRID, LATTICE)
++ TYPE(grid_3d), INTENT(IN) :: GRID
++ TYPE(latt), INTENT(IN) :: LATTICE
++ INTEGER :: SHAPE(4)
++ SHAPE = (/GRID%NGX, GRID%NGY, GRID%NGZ, GRID%MPLWV/)
++ IF (SOL_CACHE_VALID) THEN
++   IF (ANY(SHAPE /= SOL_GRID_SHAPE) .OR. ANY(ABS(LATTICE%A-SOL_CELL)>1.E-10_q)) THEN
++     CALL SOL_RESET_DRIVER
++   ENDIF
++ ENDIF
++ SOL_GRID_SHAPE = SHAPE
++ SOL_CELL = LATTICE%A
++ SOL_REFRESH = (.NOT.SOL_CACHE_VALID .OR. SOL_PHASE == 0)
++ LDO_SOL = (LSOL .AND. LSOL_SCF .AND. SOL_REFRESH)
++ SOL_PENDING = .TRUE.
++ IF (IU0>=0) WRITE(IU0,*) ' @SOL_UPDATE: evaluation=', SOL_EVALUATIONS, ' refresh=', SOL_REFRESH
++END SUBROUTINE SOL_BEGIN_DRIVER
++
++SUBROUTINE SOL_FINISH_DRIVER
++ IF (.NOT.SOL_PENDING) RETURN
++ SOL_CACHE_VALID = .TRUE.
++ SOL_PHASE = MOD(SOL_PHASE+1, SOL_UPDATE)
++ SOL_EVALUATIONS = SOL_EVALUATIONS+1
++ SOL_PENDING = .FALSE.
++ IF (IU0>=0) WRITE(IU0,*) ' @SOL_UPDATE: cache=', SUM(ABS(V_corr)), SUM(ABS(n_solv)), SOL_ECORR_BASE
++END SUBROUTINE SOL_FINISH_DRIVER
++
++
+ 
+ !******************** SUBROUTINE SOL_VCORRECTION ***********************
+ !
+ ! Computes the potential, energy and force corrections due to solvation
+ !
+ !***********************************************************************
+-SUBROUTINE SOL_VCORRECTION(CHTOT, DENCOR, CVHAR)
++SUBROUTINE SOL_VCORRECTION(CHTOT, DENCOR, CVHAR, CVION)
+  
+  USE ini
+  
+  COMPLEX(q),      INTENT(IN) :: CHTOT(:,:)
+  RGRID,           INTENT(IN) :: DENCOR(:)
+  COMPLEX(q),      INTENT(IN) :: CVHAR(:)
++ COMPLEX(q),      INTENT(IN) :: CVION(:)
+  
+  COMPLEX(q) :: n_val(:), n_e(:), phi_sol(:), CWORK(:)
+  REAL(q)    :: RWORK(:)
+@@ -3213,7 +3294,14 @@
+  
+  
+  ! early exit if possible
+- IF (.NOT.LDO_SOL) RETURN
++ IF (.NOT.LDO_SOL) THEN
++   ! Fixed solvent charge still couples to the current ionic potential.
++   ! This term supplies the derivative already present in FORLOC's n_solv force.
++   IF (SOL_UPDATE>1 .AND. SOL_CACHE_VALID) THEN
++     Ecorr_sol = SOL_ECORR_BASE + D_PROD_RC(n_solv,CVION) - SOL_ION_ENERGY_REF
++   ENDIF
++   RETURN
++ ENDIF
+  
+  
+ !-----------------------------------------------------------------------------------------
+@@ -3321,6 +3409,8 @@
+  !-------------------------------------------------------------
+  Ecorr_band = D_PROD_RC(n_val,V_corr)
+  Ecorr_sol = A_corr - Ecorr_band - q_sol*EFERMI_ref
++ SOL_ECORR_BASE = Ecorr_sol
++ SOL_ION_ENERGY_REF = D_PROD_RC(n_solv,CVION)
+  
+  dsol_io 'Ecorr=', Ecorr_sol
+  dsol_io 'A_corr=', A_corr
+@@ -3464,7 +3554,8 @@
+ 
+  TYPE (in_struct), INTENT(IN) :: IO
+  
+- INTEGER      :: IDUM, N, IERR, IU5
++ INTEGER      :: IDUM, N, IERR, IU5, IOS
++ CHARACTER(32767) :: UPDATE_TOKEN
+  REAL(q)      :: RDUM
+  COMPLEX(q)   :: CDUM
+  LOGICAL      :: LOPEN,LDUM
+@@ -3477,6 +3568,33 @@
+  LOPEN = .FALSE.
+ 
+  OPEN(UNIT=IU5,FILE='INCAR',STATUS='OLD')
++
++ SOL_UPDATE = 1
++ UPDATE_TOKEN = ''
++ CALL RDATAB(LOPEN,'INCAR',IU5,'SOL_UPDATE','=','#',';','S', &
++      IDUM,RDUM,CDUM,LDUM,UPDATE_TOKEN,N,32767,IERR)
++ IF (IERR /= 3) THEN
++   IF (IERR /= 0) THEN
++     IF (IU0>=0) WRITE(IU0,*) 'ERROR: SOL_UPDATE must be a positive integer.'
++     CALL vtutor%stopCode(isError)
++   ENDIF
++   UPDATE_TOKEN = ADJUSTL(UPDATE_TOKEN)
++   IF (LEN_TRIM(UPDATE_TOKEN)==0 .OR. VERIFY(TRIM(UPDATE_TOKEN),'0123456789')/=0) THEN
++     IF (IU0>=0) WRITE(IU0,*) 'ERROR: SOL_UPDATE must be a positive integer.'
++     CALL vtutor%stopCode(isError)
++   ENDIF
++   READ(UPDATE_TOKEN,*,IOSTAT=IOS) SOL_UPDATE
++   IF (IOS/=0) THEN
++     IF (IU0>=0) WRITE(IU0,*) 'ERROR: SOL_UPDATE integer overflow.'
++     CALL vtutor%stopCode(isError)
++   ENDIF
++   IF (SOL_UPDATE<=0) THEN
++     IF (IU0>=0) WRITE(IU0,*) 'ERROR: SOL_UPDATE must be a positive integer.'
++     CALL vtutor%stopCode(isError)
++   ENDIF
++ ENDIF
++ CALL XML_INCAR('SOL_UPDATE','I',SOL_UPDATE,RDUM,CDUM,LDUM,CHARAC,1)
++
+ 
+  !-----------------------------------------------------------------
+  ! LSOL, solvation on/off
+@@ -3577,7 +3695,6 @@
+  TYPE (in_struct), TARGET, INTENT(IN) :: IO
+  TYPE (info_struct),       INTENT(IN) :: INFO
+  
+- INTEGER :: NT
+  
+  ALLOCATE(n_solv(GRIDC%MPLWV),V_corr(GRIDC%MPLWV))
+  
+@@ -3603,10 +3720,7 @@
+  ENDIF
+  
+  ! compute total valence of system
+- ZVSUM = 0._q
+- DO NT = 1,T_INFO%NTYP
+-   ZVSUM = ZVSUM + P(NT)%ZVALF * T_INFO%NITYP(NT) * T_INFO%VCA(NT)
+- ENDDO
++ CALL SOL_UPDATE_ZVSUM(T_INFO, P)
+  
+  ! set convergence tolerence for fermi level in constant potential calculations
+  IF (EFERMI_tol <= 0._q) EFERMI_tol = 10._q*INFO%EDIFF
+@@ -3633,6 +3747,8 @@
+ 
+  TYPE (in_struct), INTENT(IN) :: IO
+  
++ IF (IO%IU6>=0) WRITE(IO%IU6,*) '   SOL_UPDATE       =', SOL_UPDATE
++
+  ! early exit if possible
+  IF (.NOT.LSOL) RETURN
+  
+@@ -3678,6 +3794,7 @@
+  
+  CALL XML_TAG("separator","solvation model")
+  
++ CALL XML_INCAR('SOL_UPDATE','I',SOL_UPDATE,RDUM,CDUM,LDUM,CHARAC,1)
+  CALL XML_INCAR('LSOL','L',IDUM,RDUM,CDUM,LSOL,CHARAC,1)
+  
+  IF (.NOT.LSOL) THEN

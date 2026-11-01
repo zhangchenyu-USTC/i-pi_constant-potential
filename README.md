@@ -9,13 +9,14 @@ The implementation supports fractional electron counts, interpolation between tw
 
 The following first-principles clients support constant-potential simulations through i-PI:
 
-- VASP 5.4.4 + vaspsol++;
+- VASP 5.4.4 / 6.3.2 + VASPsol++;
 - CP2K 2026.1;
 - ABACUS 3.11.0-beta10 (PW and LCAO).
 
 The constant-potential patches for these clients are located at:
 
 - `examples/clients/vasp/vasp-5.4.4-ipi-constant-potential.patch`
+- `examples/clients/vasp/vasp-6.3.2-ipi-constant-potential.patch`
 - `examples/clients/cp2k/cp2k-2026.1-ipi-constant-potential.patch`
 - `examples/clients/abacus/abacus-3.11.0-beta10-pr7939-ipi-constant-potential.patch`
 
@@ -64,6 +65,8 @@ Changing the total electron count in a constant-potential simulation generally g
 
 The Ne counter-electrode provides another compensation approach. Each configuration evaluation uses the current electron count and the corresponding effective Ne nuclear charge. Numerical stability depends on the electronic generalized mass, potentiostat time constant, SCF convergence, work-function averaging window, and the number and positions of Ne atoms. These settings require convergence tests for the system of interest. Future changes may allow updating the electron count once every few steps.
 
+Combining a Ne counter-electrode with implicit solvation is not supported in VASP 5.4.4 and 6.3.2. The Ne example uses `LSOL=.FALSE.`.
+
 ## Installation
 
 ### i-PI
@@ -97,9 +100,30 @@ patch --dry-run -p1 < /path/to/vasp-5.4.4-ipi-constant-potential.patch
 patch -p1 < /path/to/vasp-5.4.4-ipi-constant-potential.patch
 ```
 
-The combined patch includes the ordinary i-PI interface. Compile it using the VASP build procedure. Use `IBRION=23` for ordinary socket calculations and `IBRION=24` for constant-potential calculations.
+Both combined patches include the ordinary i-PI interface, so there is no need to apply the original i-PI patch separately or run `patch_vasp.py`. If the ordinary i-PI patch has already been applied, start again from a clean source tree. After applying the combined patch, compile using the VASP build procedure. Use `IBRION=23` for ordinary socket calculations and `IBRION=24` for constant-potential calculations.
 
 The new INCAR parameter `SOL_UPDATE` controls the VASPsol update interval. It takes a positive integer and defaults to `1`. For example, `SOL_UPDATE=5` updates the solvent response at local configuration-evaluation indices `0, 5, 10…`. Other evaluations reuse the frozen solvent field while performing electronic SCF at the current electron count and computing the energy, nuclear forces, and work function. A restart or new INIT forces an initial refresh and resets the counter; STATUS and repeated result reads do not advance it. The current setup for `SOL_UPDATE>1` uses a single bead and an independent VASP process for each endpoint. Other VASP modes use the default value `1`.
+
+### VASP 6.3.2 + VASPsol++
+
+Starting from your original VASP 6.3.2 source directory, prepare the following in order:
+
+1. The VASPsol++ patch `vaspsol++-vasp_6.3.2.patch`.
+2. The `solvation_intel.F` file matching this version and compiler, copied to `src/solvation.F`.
+3. This project's `vasp-6.3.2-ipi-constant-potential.patch`, located in `examples/clients/vasp/` in the i-PI repository.
+
+Replace `/path/to/` in the commands below with the actual paths:
+
+```bash
+cd /path/to/vasp.6.3.2
+patch --dry-run --fuzz=0 -p1 < /path/to/vaspsol++-vasp_6.3.2.patch
+patch --fuzz=0 -p1 < /path/to/vaspsol++-vasp_6.3.2.patch
+sed 's/\r$//' /path/to/solvation_intel.F > src/solvation.F
+patch --dry-run --fuzz=0 -p1 < /path/to/vasp-6.3.2-ipi-constant-potential.patch
+patch --fuzz=0 -p1 < /path/to/vasp-6.3.2-ipi-constant-potential.patch
+```
+
+The combined patch includes the ordinary i-PI interface, so there is no need to apply the original i-PI patch separately or run `patch_vasp.py`. After configuring `makefile.include`, compile using the VASP 6.3.2 build procedure, retaining its native compiler options, including `-Dvasp6`. Use `IBRION=23` for ordinary socket calculations and `IBRION=24` for constant-potential calculations.
 
 ### CP2K 2026.1
 
@@ -207,7 +231,7 @@ Two-endpoint mode defines two sockets; i-PI calls both and combines their result
 
 ### Output and restart
 
-`electronic_charge` reports the total electron count $q$, while `fermi_level` and `workfunction` report the current feedback. The Ne moving average is available as `workfunction_steps_average`. Targets, electronic momentum, and the grand potential can also be added to the properties list.
+Target values and the grand potential can be output through `fermi_level_target`, `workfunction_target`, and `Grand_canonical_potential`. Electronic momentum is saved in the checkpoint as `p_init`.
 
 To restart, read the generated checkpoint. `total_steps` specifies the final step count: set it to a value greater than the current `step` in the checkpoint, then run:
 

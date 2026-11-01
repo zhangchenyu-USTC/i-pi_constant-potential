@@ -1,7 +1,5 @@
 # A Flexible and Generalized Constant-Potential Framework in i-PI
 
-[English](README.md)
-
 本项目是在 [i-PI 3.3.0](https://github.com/i-pi/i-pi) 基础上开发的恒电势分子动力学扩展。
 它保留了 i-PI 的服务器—客户端架构，在核自由度之外引入一个系统级电子自由度，使电子数能够
 在分子动力学过程中随目标功函数动态变化。
@@ -10,13 +8,14 @@
 
 当前版本支持通过 i-PI 连接以下第一性原理客户端运行恒电势模拟：
 
-- VASP 5.4.4 + vaspsol++；
+- VASP 5.4.4 / 6.3.2 + VASPsol++；
 - CP2K 2026.1；
 - ABACUS 3.11.0-beta10（PW 和 LCAO）。
 
 三个客户端的恒电势版本补丁分别位于：
 
 - `examples/clients/vasp/vasp-5.4.4-ipi-constant-potential.patch`
+- `examples/clients/vasp/vasp-6.3.2-ipi-constant-potential.patch`
 - `examples/clients/cp2k/cp2k-2026.1-ipi-constant-potential.patch`
 - `examples/clients/abacus/abacus-3.11.0-beta10-pr7939-ipi-constant-potential.patch`
 
@@ -68,6 +67,8 @@ Ne 对电极是另一种补偿路径。当前实现每次构型求值使用当�
 其数值稳定性依赖电子广义质量、potentiostat 时间常数、SCF 收敛、功函数平均窗口以及 Ne 原子
 数目和位置，必须针对具体体系进行收敛性测试。后续可能会根据需要修改为若干步调整一次电子数。
 
+VASP 5.4.4 和 6.3.2 不支持 Ne 对电极与隐式溶剂同时使用。Ne 示例使用 `LSOL=.FALSE.`。
+
 ## 安装
 
 ### i-PI
@@ -101,9 +102,30 @@ patch --dry-run -p1 < /path/to/vasp-5.4.4-ipi-constant-potential.patch
 patch -p1 < /path/to/vasp-5.4.4-ipi-constant-potential.patch
 ```
 
-组合补丁包含普通 i-PI 接口，直接按 VASP 构建流程编译即可。普通 socket 使用 `IBRION=23`，恒电势使用 `IBRION=24`。
+两版组合补丁均包含普通 i-PI 接口，无需另外应用原版 i-PI 补丁或运行 `patch_vasp.py`。如果已应用普通 i-PI 补丁的源码，应从干净源码开始重新安装。应用组合补丁后按 VASP 构建流程编译；普通 socket 使用 `IBRION=23`，恒电势使用 `IBRION=24`。
 
 VASPsol 的更新周期由 INCAR 中新增的 `SOL_UPDATE` 参数控制，取正整数，默认 `1`。例如 `SOL_UPDATE=5` 在本地构型求值编号 `0、5、10…` 更新溶剂响应，其余构型复用冻结的溶剂场，继续进行当前电子数下的电子 SCF，并计算能量、核力和功函数。重启或重新 INIT 后首次刷新并重新计数；STATUS 和重复读取结果不计数。`SOL_UPDATE>1` 的当前使用方式是单 bead、每个端点独立 VASP 进程。其他 VASP 模式使用默认值 `1`。
+
+### VASP 6.3.2 + VASPsol++
+
+在自己的原版 VASP 6.3.2 源码目录中，依次准备：
+
+1. VASPsol++ 的 `vaspsol++-vasp_6.3.2.patch`。
+2. 与该版本及编译器配套的 `solvation_intel.F`，复制为 `src/solvation.F`。
+3. 本项目的 `vasp-6.3.2-ipi-constant-potential.patch`，位于 i-PI 仓库的 `examples/clients/vasp/` 目录。
+
+将以下命令中的 `/path/to/` 替换为实际路径：
+
+```bash
+cd /path/to/vasp.6.3.2
+patch --dry-run --fuzz=0 -p1 < /path/to/vaspsol++-vasp_6.3.2.patch
+patch --fuzz=0 -p1 < /path/to/vaspsol++-vasp_6.3.2.patch
+sed 's/\r$//' /path/to/solvation_intel.F > src/solvation.F
+patch --dry-run --fuzz=0 -p1 < /path/to/vasp-6.3.2-ipi-constant-potential.patch
+patch --fuzz=0 -p1 < /path/to/vasp-6.3.2-ipi-constant-potential.patch
+```
+
+组合补丁包含普通 i-PI 接口，无需另外应用原版 i-PI 补丁或运行 `patch_vasp.py`。配置 `makefile.include` 后，按 VASP 6.3.2 的构建流程编译，保留 `-Dvasp6` 等原生编译选项。普通 socket 使用 `IBRION=23`，恒电势使用 `IBRION=24`。
 
 ### CP2K 2026.1
 
@@ -203,7 +225,7 @@ i-pi input.xml > ipi.log 2>&1
 | `mass` | 电子数自由度的虚拟质量 |
 | `potential_average_axis`、`potential_average_region` | 功函数参考势的方向及平均区间 |
 | `charge_mixing="true"` | 在 `<electrons>` 上启用双整数端点插值 |
-| `Ne_doping="true"` | 在 `<electrons>` 上启用 Ne 反电极模式 |
+| `Ne_doping="true"` | 在 `<electrons>` 上启用 Ne 对电极模式 |
 | `workfunction_average_steps` | Ne 模式的功函数滑动平均窗口 |
 | `potentiostat` | 电子热浴类型、时间常数及可选温度 |
 
@@ -212,7 +234,7 @@ i-pi input.xml > ipi.log 2>&1
 
 ### 输出与恢复
 
-`electronic_charge` 输出总电子数 $q$，`fermi_level`、`workfunction` 输出当前反馈；Ne 滑动平均可输出 `workfunction_steps_average`。目标、电子动量和巨正则势也可加入 properties 列表。
+目标值和巨正则势可通过 `fermi_level_target`、`workfunction_target` 和 `Grand_canonical_potential` 输出。电子动量随 checkpoint 的 `p_init` 保存。
 
 恢复时读取生成的 checkpoint。`total_steps` 表示最终步数：将其设为大于 checkpoint 中当前 `step` 的值，然后运行：
 
@@ -226,7 +248,7 @@ i-pi simulation.restart > ipi-restart.log 2>&1
 |---|---|
 | [1-pes-fermi](examples/constant_potential/1-pes-fermi/) | 解析势恒费米能动力学 |
 | [2-vasp-implicit](examples/constant_potential/2-vasp-implicit/) | VASPsol++ 隐式电解液恒功函数动力学与 `SOL_UPDATE` |
-| [3-vasp-Ne](examples/constant_potential/3-vasp-Ne/) | VASP Ne 反电极恒功函数动力学 |
+| [3-vasp-Ne](examples/constant_potential/3-vasp-Ne/) | VASP Ne 对电极恒功函数动力学 |
 | [4-cp2k-implicit-mixing](examples/constant_potential/4-cp2k-implicit-mixing/) | CP2K 隐式介电环境，FARMING 双整数端点 |
 | [5-cp2k-Ne](examples/constant_potential/5-cp2k-Ne/) | CP2K Ne 分数电子数恒功函数动力学 |
 | [6-abacus-pw-compensating-charge](examples/constant_potential/6-abacus-pw-compensating-charge/) | ABACUS PW 平面补偿电荷 |

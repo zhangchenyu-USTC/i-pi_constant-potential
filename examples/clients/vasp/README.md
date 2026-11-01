@@ -1,10 +1,10 @@
 # VASP clients
 
-The combined VASP 5.4.4 patch supports ordinary i-PI calculations with
+The separate combined patches for VASP 5.4.4 and 6.3.2 support ordinary i-PI calculations with
 `IBRION=23` and constant-potential calculations with `IBRION=24`. The tested
 constant-potential executables are `vasp_gam` and `vasp_std`.
 
-## Build the constant-potential client
+## Build the VASP 5.4.4 client
 
 Start with a clean VASP 5.4.4 source tree. Apply the following preparations in
 order:
@@ -38,6 +38,41 @@ make std gam
 Use `vasp_gam` for Gamma-only calculations and `vasp_std` for general k-point
 calculations. VASP sources and POTCAR files come from your VASP installation.
 
+## Build the VASP 6.3.2 client
+
+Start with the original VASP 6.3.2 archive and prepare it in this order:
+
+1. Apply `vaspsol++-vasp_6.3.2.patch`.
+2. Copy the matching `solvation_intel.F` to `src/solvation.F`, using LF line endings.
+3. Apply [vasp-6.3.2-ipi-constant-potential.patch](vasp-6.3.2-ipi-constant-potential.patch).
+
+```bash
+cd /path/to/vasp.6.3.2
+patch --dry-run --fuzz=0 -p1 < /path/to/vaspsol++-vasp_6.3.2.patch
+patch --fuzz=0 -p1 < /path/to/vaspsol++-vasp_6.3.2.patch
+python - /path/to/solvation_intel.F <<'PY'
+from pathlib import Path
+import sys
+Path('src/solvation.F').write_bytes(Path(sys.argv[1]).read_bytes().replace(b'\r\n', b'\n'))
+PY
+patch --dry-run --fuzz=0 -p1 < /path/to/vasp-6.3.2-ipi-constant-potential.patch
+patch --fuzz=0 -p1 < /path/to/vasp-6.3.2-ipi-constant-potential.patch
+cp arch/makefile.include.intel makefile.include
+# Set the compiler, MPI and MKL paths for your installation.
+make -j 12 DEPS=1 gam
+make -j 12 DEPS=1 std
+```
+
+Keep the VASP 6 compiler options, including `-Dvasp6`. Intel Fortran 2021.3
+uses `-mkl=sequential` in place of the template's `-qmkl=sequential`.
+The combined patch includes the ordinary socket interface; apply it directly
+to this prepared baseline. The VASP 5.4.4 update, separate ordinary i-PI patch,
+and `cp-vaspsol++.patch` are not part of this installation sequence.
+
+The 6.3.2 port uses CPU `gam` and `std` for constant-potential calculations;
+`ncl` is included in the build checks. The XML input and socket protocol are
+the same as for 5.4.4. Use the two examples below with the new executable.
+
 ## Run directly on a node
 
 Copy either the [implicit-solvent example](../../constant_potential/2-vasp-implicit/)
@@ -45,6 +80,9 @@ or the [Ne example](../../constant_potential/3-vasp-Ne/) to a run directory.
 Prepare a local `POTCAR` in the species order of `POSCAR`, and keep the atom order
 consistent with `init.xyz`. The first example uses VASPsol++; the second uses Ne
 core-charge adjustment with implicit solvation disabled.
+
+Combining Ne core-charge adjustment with implicit solvation is currently
+unsupported in both versions. Use `LSOL=.FALSE.` for the Ne example.
 
 Start i-PI in one terminal:
 
@@ -67,6 +105,29 @@ Choose the MPI process count together with `NCORE` in `INCAR`. Set `IHOST`,
 potential-reference window are configured in the XML input. For a remote
 client, use a host address and port reachable from the VASP node. Each VASP
 process group needs its own run directory.
+
+To run either repository example for three steps and check its four socket
+evaluations, use the same Python environment as i-PI:
+
+```bash
+ulimit -s unlimited
+python examples/clients/vasp/check_example.py \
+  --example 2-vasp-implicit --vasp /path/to/vasp_gam \
+  --potcar /path/to/implicit/POTCAR --ranks 48 --work /path/to/new-test-directory
+```
+
+For the Ne example, select `--example 3-vasp-Ne` and its matching POTCAR.
+The script checks electron numbers, finite responses, the work-function
+relation, SCF convergence, evaluation counts, and both exit codes. It writes
+the inputs and results into the specified new directory.
+
+In both patched VASP versions, `IBRION=23/24` writes and flushes one
+`F= ... E0= ... d E = ...` summary to OSZICAR for each configuration
+evaluation. The local counter starts at 1, including the initial configuration;
+`STATUS` and repeated `GETFORCE` requests do not add summaries. `F` is the
+electronic free energy and `E0` is the zero-smearing extrapolation, in eV.
+The `d E` field follows VASP's static/socket output convention (the electronic
+entropy contribution); it is not the difference between successive frames.
 
 ## Solvent update interval
 
