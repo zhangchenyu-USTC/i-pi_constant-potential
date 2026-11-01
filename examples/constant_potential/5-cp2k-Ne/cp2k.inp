@@ -49,7 +49,9 @@
     CORE_CORR_DIP TRUE
     SURFACE_DIPOLE_CORRECTION TRUE
     SURF_DIP_DIR Z
-    #SURF_DIP_POS 40.0
+    # Vacuum cut for this 45-A cell; choose it again for a different geometry.
+    SURF_DIP_POS 35.0
+    SURF_DIP_SWITCH FALSE
     &MGRID
       CUTOFF 400
       REL_CUTOFF 50
@@ -57,15 +59,16 @@
     &QS
       METHOD GPW
       EPS_DEFAULT 1.0E-10
-      EXTRAPOLATION USE_GUESS
+      EXTRAPOLATION USE_PREV_P
       EXTRAPOLATION_ORDER 3
     &END QS
 	
     &SCF
-      SCF_GUESS ATOMIC
+      SCF_GUESS RESTART
       ADDED_MOS 100
       EPS_SCF 1.0E-5
       MAX_SCF 5000
+      IGNORE_CONVERGENCE_FAILURE FALSE
       &SMEAR ON
         METHOD FERMI_DIRAC
         ELECTRONIC_TEMPERATURE [K] 300
@@ -75,9 +78,9 @@
       &END DIAGONALIZATION
       &MIXING
         METHOD BROYDEN_MIXING
-        ALPHA 0.2
+        ALPHA 0.1
         BETA 0.5
-        NBROYDEN 8
+        NBROYDEN 16
       &END MIXING
     &END SCF
 	

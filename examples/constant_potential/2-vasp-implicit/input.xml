@@ -50,7 +50,6 @@
           <!-- Fictitious inertia of q; this controls electronic-coordinate dynamics, not a physical electron mass. -->
           <mass units="atomic_unit">400.0</mass>
           <!-- Recompute the complete implicit-solvent response at steps 0, 5, 10, ...; q is updated every step. -->
-          <solvation_update_stride>5</solvation_update_stride>
           <!-- SVR thermostat for q and its conjugate momentum. -->
           <potentiostat mode="svr">
             <!-- Relaxation time of the electronic SVR thermostat. -->

@@ -1,42 +1,16 @@
-diff --git a/docs/advanced/input_files/input-main.md b/docs/advanced/input_files/input-main.md
-index fc7f4ba..08a25fb 100644
---- a/docs/advanced/input_files/input-main.md
-+++ b/docs/advanced/input_files/input-main.md
-@@ -664,7 +664,11 @@
-   - path:UNIX, for example /tmp/ipi_abacus_si:UNIX, opens a Unix-domain socket at the given filesystem path. The :UNIX suffix tells ABACUS that the preceding value is a local socket path rather than a TCP host name. This form only works on the same machine.
-   When using the ASE AbacusSocketIO interface, this environment variable is set automatically from the port or unixsocket calculator argument.
- 
--  Socket mode always computes energy. Force and stress extraction follows cal_force and cal_stress independently; disabled properties are sent as protocol padding and marked absent in the ABACUS i-PI extras metadata, not reported as physical zero values. This metadata extension is required for safe optional-property handling: a legacy response with empty extras is accepted only for energy-only use, while a generic client that ignores extras cannot distinguish padding from a computed zero. A non-converged SCF step is returned with scf_converged=false metadata so an external driver can choose its policy.
-+  Socket mode always computes energy. Force and stress extraction follows cal_force and cal_stress independently; disabled properties are sent as protocol padding and marked absent in the ABACUS i-PI extras metadata, not reported as physical zero values. This metadata extension is required for safe optional-property handling: a legacy response with empty extras is accepted only for energy-only use, while a generic client that ignores extras cannot distinguish padding from a computed zero. A non-converged ordinary SCF step is returned with scf_converged=false metadata so an external driver can choose its policy.
-+
-+  Socket mode defaults symmetry to 0 so moving atoms do not retain the initial STRU spatial symmetry; an explicit symmetry input remains unchanged.
-+
-+  Constant-potential i-PI sessions use INIT electron metadata and CHGDATA before each POSDATA to set the total electron number. Use fixed-cell CPU double-precision norm-conserving PW/LCAO KSDFT with cal_force=1, cal_stress=0, symmetry=0 or -1, and nspin=1 or 2. CHGDATA flags are zero. Constant-potential electron control is incompatible with the energy-only Makov-Payne correction (assume_isolated=makov-payne). Each response contains the converged energy and forces, actual electron count, Fermi level, and requested work function. Set electron-control options in the i-PI electrons block. See the [i-PI examples and tests](https://github.com/zhangchenyu-USTC/i-pi_constant-potential/tree/abacus-develop-validation/examples/clients/abacus/validation).
- - **Default**: False
- 
- ### esolver_type
-diff --git a/docs/parameters.yaml b/docs/parameters.yaml
-index f7c8a9d..0f259a8 100644
---- a/docs/parameters.yaml
-+++ b/docs/parameters.yaml
-@@ -57,7 +57,11 @@ parameters:
-       * path:UNIX, for example /tmp/ipi_abacus_si:UNIX, opens a Unix-domain socket at the given filesystem path. The :UNIX suffix tells ABACUS that the preceding value is a local socket path rather than a TCP host name. This form only works on the same machine.
-       When using the ASE AbacusSocketIO interface, this environment variable is set automatically from the port or unixsocket calculator argument.
- 
--      Socket mode always computes energy. Force and stress extraction follows cal_force and cal_stress independently; disabled properties are sent as protocol padding and marked absent in the ABACUS i-PI extras metadata, not reported as physical zero values. This metadata extension is required for safe optional-property handling: a legacy response with empty extras is accepted only for energy-only use, while a generic client that ignores extras cannot distinguish padding from a computed zero. A non-converged SCF step is returned with scf_converged=false metadata so an external driver can choose its policy.
-+      Socket mode always computes energy. Force and stress extraction follows cal_force and cal_stress independently; disabled properties are sent as protocol padding and marked absent in the ABACUS i-PI extras metadata, not reported as physical zero values. This metadata extension is required for safe optional-property handling: a legacy response with empty extras is accepted only for energy-only use, while a generic client that ignores extras cannot distinguish padding from a computed zero. A non-converged ordinary SCF step is returned with scf_converged=false metadata so an external driver can choose its policy.
-+
-+      Socket mode defaults symmetry to 0 so moving atoms do not retain the initial STRU spatial symmetry; an explicit symmetry input remains unchanged.
-+
-+      Constant-potential i-PI sessions use INIT electron metadata and CHGDATA before each POSDATA to set the total electron number. Use fixed-cell CPU double-precision norm-conserving PW/LCAO KSDFT with cal_force=1, cal_stress=0, symmetry=0 or -1, and nspin=1 or 2. CHGDATA flags are zero. Constant-potential electron control is incompatible with the energy-only Makov-Payne correction (assume_isolated=makov-payne). Each response contains the converged energy and forces, actual electron count, Fermi level, and requested work function. Set electron-control options in the i-PI electrons block. See the [i-PI examples and tests](https://github.com/zhangchenyu-USTC/i-pi_constant-potential/tree/abacus-develop-validation/examples/clients/abacus/validation).
-     default_value: "False"
-     unit: ""
-     availability: ""
 diff --git a/source/Makefile.Objects b/source/Makefile.Objects
-index 7514f75..a8895af 100644
+index 243b1ee57..5e49112cc 100644
 --- a/source/Makefile.Objects
 +++ b/source/Makefile.Objects
-@@ -283,6 +283,7 @@ OBJS_ELECSTAT=elecstate.o\
+@@ -271,6 +271,7 @@ OBJS_DEEPKS=lcao_deepks.o\
+ 
+ 
+ OBJS_ELECSTAT=elecstate.o\
++    electronic_occupations.o\
+     init_scf.o\
+     param_update.o\
+     estate_e_terms.o\
+@@ -298,6 +299,7 @@ OBJS_ELECSTAT=elecstate.o\
      efield.o\
      gatefield.o\
      potential_new.o\
@@ -44,16 +18,7 @@ index 7514f75..a8895af 100644
      potential_types.o\
      pot_surchem.o\
      pot_sep.o\
-@@ -322,6 +323,8 @@ OBJS_ELECSTAT_LCAO=elecstate_lcao.o\
- OBJS_ESOLVER=esolver_factory.o\
-     esolver_ks.o\
-     esolver_fp.o\
-+    esolver_fp_electronic.o\
-+    electronic_occupations.o\
-     esolver_ks_pw.o\
-     esolver_ks_pw_tddft.o\
-     esolver_ks_lcaopw.o\
-@@ -592,6 +595,7 @@ OBJS_RELAXATION=relax_data.o\
+@@ -624,6 +626,7 @@ OBJS_RELAXATION=relax_data.o\
      socket_driver.o\
      socket_utils.o\
      socket_handlers.o\
@@ -61,29 +26,319 @@ index 7514f75..a8895af 100644
      cg_base.o\
      bfgs_basic.o\
      relax_driver.o\
-diff --git a/source/source_esolver/CMakeLists.txt b/source/source_esolver/CMakeLists.txt
-index 95488f4..a8c5128 100644
---- a/source/source_esolver/CMakeLists.txt
-+++ b/source/source_esolver/CMakeLists.txt
-@@ -2,6 +2,8 @@ list(APPEND objects
-     esolver_factory.cpp
-     esolver_ks.cpp
-     esolver_fp.cpp
-+    esolver_fp_electronic.cpp
+diff --git a/source/source_esolver/esolver.h b/source/source_esolver/esolver.h
+index f302584cb..b89ec6bac 100644
+--- a/source/source_esolver/esolver.h
++++ b/source/source_esolver/esolver.h
+@@ -6,6 +6,14 @@
+ #include "source_cell/unitcell.h"
+ 
+ struct Input_para;
++class Parameter;
++
++namespace elecstate
++{
++struct ElectronicControl;
++struct PotentialWindow;
++struct ElectronicObservables;
++}
+ 
+ namespace ModuleESolver
+ {
+@@ -46,6 +54,11 @@ class ESolver
+     //! calcualte stress of given cell
+     virtual void cal_stress(BaseCell& cell, ModuleBase::matrix& stress) = 0;
+ 
++    // Optional first-principles capability. Unsupported solvers return false.
++    virtual bool apply_electronic_control(Parameter&, const elecstate::ElectronicControl&) { return false; }
++    virtual bool electronic_observables(const UnitCell&, const Parameter&, const elecstate::PotentialWindow&,
++                                       elecstate::ElectronicObservables&) const { return false; }
++
+     bool conv_esolver = true; // whether esolver is converged
+ 
+     std::string classname;
+diff --git a/source/source_esolver/esolver_fp.cpp b/source/source_esolver/esolver_fp.cpp
+index 070e860f3..554d69b84 100644
+--- a/source/source_esolver/esolver_fp.cpp
++++ b/source/source_esolver/esolver_fp.cpp
+@@ -1,4 +1,10 @@
+ #include "esolver_fp.h"
++#include "source_estate/electronic_control.h"
++#include "source_estate/electronic_occupations.h"
++#include "source_estate/elecstate_tools.h"
++#include "source_estate/module_pot/electrostatic_potential.h"
++
++#include <stdexcept>
+ 
+ #include "source_basis/module_pw/pw_basis_big.h" // use PW_Basis_Big
+ #include "source_base/tool_quit.h"
+@@ -24,6 +30,34 @@
+ #include "source_base/module_parallel/para_bridge.h"
+ namespace ModuleESolver
+ {
++bool ESolver_FP::apply_electronic_control(Parameter& parameters, const elecstate::ElectronicControl& control)
++{
++    if (!pelec || !pelec->charge || !pelec->pot)
++    { throw std::runtime_error("electronic state is not initialized for electron control"); }
++    elecstate::ParamUpdater::update_electron_count(control.nelect, parameters);
++    elecstate::update_electron_count(*pelec, control.nelect, parameters.inp.nspin,
++                                   parameters.inp.nupdown, parameters.globalv.two_fermi);
++    return true;
++}
++
++bool ESolver_FP::electronic_observables(const UnitCell& ucell, const Parameter& parameters,
++                                       const elecstate::PotentialWindow& window,
++                                       elecstate::ElectronicObservables& result) const
++{
++    if (!this->conv_esolver || !pelec || !pelec->charge || !pelec->pot)
++    { throw std::runtime_error("electronic observables require a converged SCF state"); }
++    const int npool = parameters.inp.kpar * parameters.inp.bndpar;
++    result.nelect = elecstate::checked_occupation_electron_count(pelec->wg, parameters.inp.nelec,
++                                                               npool, pw_rhod->poolnproc);
++    result.fermi_ry = elecstate::electronic_chemical_potential(pelec->eferm, parameters.globalv.two_fermi);
++    if (window.axis >= 0)
++    {
++        result.reference_ry = elecstate::electrostatic_reference(ucell, *pw_rhod, *pelec->charge,
++                                                                *pelec->pot, solvent, parameters.inp, window);
++    }
++    return true;
++}
++
+ 
+ ESolver_FP::ESolver_FP()
+ {
+diff --git a/source/source_esolver/esolver_fp.h b/source/source_esolver/esolver_fp.h
+index 39612979a..f9c39d378 100644
+--- a/source/source_esolver/esolver_fp.h
++++ b/source/source_esolver/esolver_fp.h
+@@ -41,6 +41,10 @@ class ESolver_FP : public ESolver
+ 
+     virtual void after_all_runners(BaseCell& basecell) override;
+ 
++    bool apply_electronic_control(Parameter& parameters, const elecstate::ElectronicControl& control) override;
++    bool electronic_observables(const UnitCell& ucell, const Parameter& parameters,
++                               const elecstate::PotentialWindow& window, elecstate::ElectronicObservables& result) const override;
++
+   protected:
+     virtual void before_scf(UnitCell& ucell, const int istep);
+ 
+diff --git a/source/source_esolver/esolver_ks.cpp b/source/source_esolver/esolver_ks.cpp
+index dcb2a3c61..26170a09a 100644
+--- a/source/source_esolver/esolver_ks.cpp
++++ b/source/source_esolver/esolver_ks.cpp
+@@ -179,12 +179,14 @@ void ESolver_KS::runner(BaseCell& basecell, const int istep)
+     ModuleBase::TITLE("ESolver_KS", "runner");
+     ModuleBase::timer::start(this->classname, "runner");
+ 
++    this->conv_esolver = false;
++
+     // 1) before_scf (electronic iteration loops)
+     this->before_scf(ucell, istep);
+     ModuleBase::GlobalFunc::DONE(GlobalV::ofs_running, "INIT SCF");
+ 
+     const int iter_limit = this->scf_iter_limit(istep);
+-    const bool converged = this->scf_loop(ucell, istep, iter_limit);
++    const bool converged = this->scf_loop(ucell, istep, iter_limit) && !this->oscillate_esolver;
+     this->after_scf(ucell, istep, converged);
+     this->conv_esolver = converged;
+     ModuleBase::timer::end(this->classname, "runner");
+diff --git a/source/source_esolver/esolver_ks_lcao.cpp b/source/source_esolver/esolver_ks_lcao.cpp
+index f476cf78d..2e0b1c7fa 100644
+--- a/source/source_esolver/esolver_ks_lcao.cpp
++++ b/source/source_esolver/esolver_ks_lcao.cpp
+@@ -162,6 +162,17 @@ void ESolver_KS_LCAO<TK, TR>::before_all_runners(BaseCell& basecell, const Input
+     return;
+ }
+ 
++template <typename TK, typename TR>
++bool ESolver_KS_LCAO<TK, TR>::apply_electronic_control(Parameter& parameters, const elecstate::ElectronicControl& control)
++{
++    if (!ESolver_FP::apply_electronic_control(parameters, control)) { return false; }
++#ifdef __EXX
++    if (this->exx_nao.exd) { this->exx_nao.exd->begin_electronic_step(); }
++    if (this->exx_nao.exc) { this->exx_nao.exc->begin_electronic_step(); }
++#endif
++    return true;
++}
++
+ template <typename TK, typename TR>
+ void ESolver_KS_LCAO<TK, TR>::before_scf(UnitCell& ucell, const int istep)
+ {
+diff --git a/source/source_esolver/esolver_ks_lcao.h b/source/source_esolver/esolver_ks_lcao.h
+index 6fca9c417..032facf42 100644
+--- a/source/source_esolver/esolver_ks_lcao.h
++++ b/source/source_esolver/esolver_ks_lcao.h
+@@ -35,6 +35,8 @@ class ESolver_KS_LCAO : public ESolver_KS
+     //! Release the electronic wave functions.
+     ~ESolver_KS_LCAO();
+ 
++    bool apply_electronic_control(Parameter& parameters, const elecstate::ElectronicControl& control) override;
++
+     //! Initialize the LCAO basis, electronic state, and potentials before all steps.
+     void before_all_runners(BaseCell& basecell, const Input_para& inp) override;
+ 
+diff --git a/source/source_esolver/esolver_ks_pw.cpp b/source/source_esolver/esolver_ks_pw.cpp
+index c700eefa0..330e01937 100644
+--- a/source/source_esolver/esolver_ks_pw.cpp
++++ b/source/source_esolver/esolver_ks_pw.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "source_estate/module_charge/chg_routine.h"  // use charge mixing, mohan add 20251006
+ #include "source_estate/setup_estate_pw.h"            // mohan add 20251005
++#include "source_hamilt/module_xc/xc_functional.h"
+ #include "source_hamilt/module_xc/general_exx_info.h" // for General_Exx_Info type used via general_exx_info_
+ #include "source_io/module_ctrl/ctrl_output_pw.h"     // mohan add 20250927
+ #include "source_pw/module_pwdft/dftu_base.h"
+@@ -159,6 +160,16 @@ void ESolver_KS_PW<T, Device>::before_all_runners(BaseCell& basecell, const Inpu
+     this->exx_helper->init(ucell, inp, this->pelec->wg, this->general_exx_info_);
+ }
+ 
++template <typename T, typename Device>
++bool ESolver_KS_PW<T, Device>::apply_electronic_control(Parameter& parameters, const elecstate::ElectronicControl& control)
++{
++    const int functional_type = XC_Functional::get_func_type();
++    validate_electronic_step_exx(functional_type, this->general_exx_info_.cal_exx);
++    if (!ESolver_FP::apply_electronic_control(parameters, control)) { return false; }
++    this->exx_helper->begin_electronic_step();
++    return true;
++}
++
+ template <typename T, typename Device>
+ void ESolver_KS_PW<T, Device>::before_scf(UnitCell& ucell, const int istep)
+ {
+diff --git a/source/source_esolver/esolver_ks_pw.h b/source/source_esolver/esolver_ks_pw.h
+index a03e73c94..53257a91c 100644
+--- a/source/source_esolver/esolver_ks_pw.h
++++ b/source/source_esolver/esolver_ks_pw.h
+@@ -34,6 +34,8 @@ class ESolver_KS_PW : public ESolver_KS
+ 
+     Exx_HelperBase* exx_helper = nullptr;
+ 
++    bool apply_electronic_control(Parameter& parameters, const elecstate::ElectronicControl& control) override;
++
+   protected:
+     virtual void before_scf(UnitCell& ucell, const int istep) override;
+ 
+diff --git a/source/source_estate/CMakeLists.txt b/source/source_estate/CMakeLists.txt
+index 3dd1a4425..5f8fe4eda 100644
+--- a/source/source_estate/CMakeLists.txt
++++ b/source/source_estate/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ list(APPEND objects
+     elecstate.cpp
 +    electronic_occupations.cpp
-     esolver_ks_pw.cpp
-     esolver_ks_pw_tddft.cpp
-     esolver_ks_lcaopw.cpp
-diff --git a/source/source_esolver/electronic_control.h b/source/source_esolver/electronic_control.h
+     init_scf.cpp
+     estate_e_terms.cpp
+     elecstate_energy.cpp
+@@ -17,6 +18,7 @@ list(APPEND objects
+     module_pot/gatefield.cpp
+     module_pot/efield.cpp
+     module_pot/h_hartree_pw.cpp
++    module_pot/electrostatic_potential.cpp
+     module_pot/h_tddft_pw.cpp
+     module_pot/pot_xc.cpp
+     module_pot/pot_local.cpp
+diff --git a/source/source_estate/elecstate.cpp b/source/source_estate/elecstate.cpp
+index 5ed97e678..7b012a3c8 100644
+--- a/source/source_estate/elecstate.cpp
++++ b/source/source_estate/elecstate.cpp
+@@ -16,11 +16,16 @@ const double* ElecState::getRho(int spin) const
+ 
+ void ElecState::init_nelec_spin()
+ {
+-    this->nelec_spin.resize(PARAM.inp.nspin);
+-    if (PARAM.inp.nspin == 2)
++    this->init_nelec_spin(PARAM.inp.nspin, PARAM.inp.nelec, PARAM.inp.nupdown);
++}
++
++void ElecState::init_nelec_spin(int nspin, double nelect, double nupdown)
++{
++    this->nelec_spin.resize(nspin);
++    if (nspin == 2)
+     {
+-        this->nelec_spin[0] = (PARAM.inp.nelec + PARAM.inp.nupdown) / 2.0;
+-        this->nelec_spin[1] = (PARAM.inp.nelec - PARAM.inp.nupdown) / 2.0;
++        this->nelec_spin[0] = (nelect + nupdown) / 2.0;
++        this->nelec_spin[1] = (nelect - nupdown) / 2.0;
+     }
+ }
+ 
+diff --git a/source/source_estate/elecstate.h b/source/source_estate/elecstate.h
+index ba96ff145..a5643e6d7 100644
+--- a/source/source_estate/elecstate.h
++++ b/source/source_estate/elecstate.h
+@@ -116,6 +116,7 @@ class ElecState
+     // if nupdown is not 0(TWO_EFERMI case),
+     // nelec_spin will be fixed and weights will be constrained
+     void init_nelec_spin();
++    void init_nelec_spin(int nspin, double nelect, double nupdown);
+     // used to record number of electrons per spin index
+     // for NSPIN=2, it will record number of spin up and number of spin down
+     // for NSPIN=4, it will record total number, magnetization for x, y, z direction
+diff --git a/source/source_estate/elecstate_tools.cpp b/source/source_estate/elecstate_tools.cpp
+index 3b64aca04..c1834c18f 100644
+--- a/source/source_estate/elecstate_tools.cpp
++++ b/source/source_estate/elecstate_tools.cpp
+@@ -1,6 +1,9 @@
+ #include "elecstate_tools.h"
+ 
+ #include "occupy.h"
++
++#include <cmath>
++#include <stdexcept>
+ #include "source_base/module_parallel/para_band_output.h"
+ #include "source_base/module_parallel/para_bridge.h"
+ #include "source_base/parallel_reduce.h"
+@@ -9,6 +12,25 @@
+ 
+ namespace elecstate
+ {
++void update_electron_count(ElecState& state, double nelect, int nspin, double nupdown, bool two_fermi)
++{
++    state.eferm.two_efermi = two_fermi;
++    state.init_nelec_spin(nspin, nelect, nupdown);
++}
++
++double electronic_chemical_potential(const Efermi& fermi, bool two_fermi)
++{
++    double chemical_potential = fermi.ef;
++    if (two_fermi)
++    {
++        // Total-N derivative at fixed N_up-N_down.
++        chemical_potential = 0.5 * (fermi.ef_up + fermi.ef_dw);
++    }
++    if (!std::isfinite(chemical_potential))
++    { throw std::runtime_error("non-finite SCF chemical potential"); }
++    return chemical_potential;
++}
++
+ void calEBand(const ModuleBase::matrix& ekb, const ModuleBase::matrix& wg, fenergy& f_en)
+ {
+     ModuleBase::TITLE("ElecState", "calEBand");
+diff --git a/source/source_estate/elecstate_tools.h b/source/source_estate/elecstate_tools.h
+index bf1f4bb42..d7471cb4d 100644
+--- a/source/source_estate/elecstate_tools.h
++++ b/source/source_estate/elecstate_tools.h
+@@ -5,6 +5,9 @@
+ 
+ namespace elecstate
+ {
++void update_electron_count(ElecState& state, double nelect, int nspin, double nupdown, bool two_fermi);
++double electronic_chemical_potential(const Efermi& fermi, bool two_fermi);
++
+ void calEBand(const ModuleBase::matrix& ekb, const ModuleBase::matrix& wg, fenergy& f_en);
+ 
+ void calculate_weights(const ModuleBase::matrix& ekb,
+diff --git a/source/source_estate/electronic_control.h b/source/source_estate/electronic_control.h
 new file mode 100644
-index 0000000..225fdb2
+index 000000000..9bd7839fe
 --- /dev/null
-+++ b/source/source_esolver/electronic_control.h
++++ b/source/source_estate/electronic_control.h
 @@ -0,0 +1,27 @@
 +#ifndef ABACUS_ELECTRONIC_CONTROL_H
 +#define ABACUS_ELECTRONIC_CONTROL_H
 +
-+namespace ModuleESolver
++namespace elecstate
 +{
 +// Physical requests and results; no socket or serialization dependencies.
 +struct ElectronicControl
@@ -107,11 +362,11 @@ index 0000000..225fdb2
 +}
 +
 +#endif
-diff --git a/source/source_esolver/electronic_occupations.cpp b/source/source_esolver/electronic_occupations.cpp
+diff --git a/source/source_estate/electronic_occupations.cpp b/source/source_estate/electronic_occupations.cpp
 new file mode 100644
-index 0000000..fe8cbbe
+index 000000000..37917edab
 --- /dev/null
-+++ b/source/source_esolver/electronic_occupations.cpp
++++ b/source/source_estate/electronic_occupations.cpp
 @@ -0,0 +1,65 @@
 +#include "electronic_occupations.h"
 +#include "source_base/matrix.h"
@@ -122,7 +377,7 @@ index 0000000..fe8cbbe
 +#include <sstream>
 +#include <stdexcept>
 +
-+namespace ModuleESolver
++namespace elecstate
 +{
 +double checked_occupation_electron_count(const ModuleBase::matrix& weights,
 +                                         double requested_nelect,
@@ -178,11 +433,11 @@ index 0000000..fe8cbbe
 +    return occupied;
 +}
 +}
-diff --git a/source/source_esolver/electronic_occupations.h b/source/source_esolver/electronic_occupations.h
+diff --git a/source/source_estate/electronic_occupations.h b/source/source_estate/electronic_occupations.h
 new file mode 100644
-index 0000000..a3c6a18
+index 000000000..3b014171b
 --- /dev/null
-+++ b/source/source_esolver/electronic_occupations.h
++++ b/source/source_estate/electronic_occupations.h
 @@ -0,0 +1,20 @@
 +#ifndef ABACUS_ELECTRONIC_OCCUPATIONS_H
 +#define ABACUS_ELECTRONIC_OCCUPATIONS_H
@@ -192,7 +447,7 @@ index 0000000..a3c6a18
 +class matrix;
 +}
 +
-+namespace ModuleESolver
++namespace elecstate
 +{
 +// weights already include k-point weights and spin degeneracy. Rows/bands are
 +// partitioned across npool groups and replicated on ranks_per_pool ranks.
@@ -204,546 +459,15 @@ index 0000000..a3c6a18
 +}
 +
 +#endif
-diff --git a/source/source_esolver/esolver.h b/source/source_esolver/esolver.h
-index f302584..def0667 100644
---- a/source/source_esolver/esolver.h
-+++ b/source/source_esolver/esolver.h
-@@ -6,9 +6,13 @@
- #include "source_cell/unitcell.h"
- 
- struct Input_para;
-+class Parameter;
- 
- namespace ModuleESolver
- {
-+struct ElectronicControl;
-+struct PotentialWindow;
-+struct ElectronicObservables;
- class ESolver
- {
-   public:
-@@ -46,6 +50,11 @@ class ESolver
-     //! calcualte stress of given cell
-     virtual void cal_stress(BaseCell& cell, ModuleBase::matrix& stress) = 0;
- 
-+    // Optional first-principles capability. Unsupported solvers return false.
-+    virtual bool apply_electronic_control(Parameter&, const ElectronicControl&) { return false; }
-+    virtual bool electronic_observables(const UnitCell&, const Parameter&, const PotentialWindow&,
-+                                       ElectronicObservables&) const { return false; }
-+
-     bool conv_esolver = true; // whether esolver is converged
- 
-     std::string classname;
-diff --git a/source/source_esolver/esolver_fp.h b/source/source_esolver/esolver_fp.h
-index 8d409b9..a5b2b01 100644
---- a/source/source_esolver/esolver_fp.h
-+++ b/source/source_esolver/esolver_fp.h
-@@ -41,6 +41,10 @@ class ESolver_FP : public ESolver
- 
-     virtual void after_all_runners(BaseCell& basecell) override;
- 
-+    bool apply_electronic_control(Parameter& parameters, const ElectronicControl& control) override;
-+    bool electronic_observables(const UnitCell& ucell, const Parameter& parameters,
-+                               const PotentialWindow& window, ElectronicObservables& result) const override;
-+
-   protected:
-     virtual void before_scf(UnitCell& ucell, const int istep);
- 
-diff --git a/source/source_esolver/esolver_fp_electronic.cpp b/source/source_esolver/esolver_fp_electronic.cpp
-new file mode 100644
-index 0000000..f6be71e
---- /dev/null
-+++ b/source/source_esolver/esolver_fp_electronic.cpp
-@@ -0,0 +1,106 @@
-+#include "esolver_fp.h"
-+#include "electronic_control.h"
-+#include "electronic_occupations.h"
-+#include "source_estate/param_update.h"
-+#include "source_estate/module_pot/electrostatic_potential.h"
-+#include "source_io/module_parameter/parameter.h"
-+#include "source_hamilt/module_xc/xc_functional.h"
-+
-+#include <cmath>
-+#include <stdexcept>
-+
-+namespace ModuleESolver
-+{
-+bool ESolver_FP::apply_electronic_control(Parameter& parameters, const ElectronicControl& control)
-+{
-+    const auto& inp = parameters.inp;
-+    if (inp.assume_isolated == "makov-payne")
-+    {
-+        throw std::runtime_error(
-+            "constant-potential electron control is incompatible with the energy-only Makov-Payne correction");
-+    }
-+    if (inp.esolver_type != "ksdft" || (inp.basis_type != "pw" && inp.basis_type != "lcao")
-+        || inp.device != "cpu" || inp.precision != "double" || parameters.globalv.use_uspp
-+        || inp.sc_mag_switch || inp.deepks_scf || inp.rpa || inp.rdmft || inp.dft_plus_dmft)
-+    {
-+        throw std::runtime_error(
-+            "constant-potential control requires CPU double-precision PW/LCAO KSDFT with "
-+            "norm-conserving pseudopotentials; specialized solver corrections are not supported");
-+    }
-+    const int functional_type = XC_Functional::get_func_type();
-+    if (functional_type < 1 || functional_type > 5)
-+    {
-+        throw std::runtime_error(
-+            "constant-potential control requires a supported KS exchange-correlation functional");
-+    }
-+    if (inp.dft_plus_u != 0 && inp.dft_plus_u != 1)
-+    {
-+        throw std::runtime_error(
-+            "constant-potential forces require dft_plus_u=1; "
-+            "the legacy dft_plus_u=2 force implementation is unavailable");
-+    }
-+    if (inp.dft_plus_u && (inp.occ_mat_ctrl < 0 || inp.occ_mat_ctrl > 1
-+                          || inp.yukawa_potential || parameters.globalv.uramping > 0.0))
-+    {
-+        throw std::runtime_error(
-+            "constant-potential DFT+U requires fixed Hubbard U and self-consistent occupations "
-+            "(omc=0/1, yukawa_potential=false, uramping disabled)");
-+    }
-+    if (inp.init_chg == "dm_no_renormalize")
-+    { throw std::runtime_error("electron-number control requires charge-density renormalization"); }
-+    if (inp.nspin != 1 && inp.nspin != 2)
-+    { throw std::runtime_error("constant-potential control supports only nspin=1 or 2"); }
-+    if (inp.ocp || inp.nbands <= 0 || !std::isfinite(control.nelect) || control.nelect <= 0.0)
-+    { throw std::runtime_error("invalid total electron number, band capacity, or fixed occupation array"); }
-+    const bool two_fermi = parameters.globalv.two_fermi;
-+    if (two_fermi && inp.nspin != 2)
-+    { throw std::runtime_error("two_fermi electron control requires nspin=2"); }
-+    const double up = 0.5 * (control.nelect + inp.nupdown);
-+    const double down = 0.5 * (control.nelect - inp.nupdown);
-+    if ((two_fermi && (!std::isfinite(inp.nupdown) || up <= 0.0 || down <= 0.0
-+                      || up > inp.nbands || down > inp.nbands))
-+        || control.nelect > 2.0 * inp.nbands)
-+    {
-+        throw std::runtime_error(
-+            "electron number exceeds band capacity or gives invalid spin populations; increase nbands");
-+    }
-+    if (inp.smearing_method == "fixed"
-+        && (std::abs(control.nelect - std::round(control.nelect)) > 1.0e-8
-+            || (two_fermi && (std::abs(up-std::round(up)) > 1.0e-8 || std::abs(down-std::round(down)) > 1.0e-8))))
-+    { throw std::runtime_error("fractional electron populations require a smearing occupation method"); }
-+    if (!pelec || !pelec->charge || !pelec->pot)
-+    { throw std::runtime_error("electronic state is not initialized for electron control"); }
-+
-+    elecstate::ParamUpdater::update_electron_count(control.nelect, parameters);
-+    pelec->eferm.two_efermi = two_fermi;
-+    pelec->init_nelec_spin();
-+    return true;
-+}
-+
-+bool ESolver_FP::electronic_observables(const UnitCell& ucell, const Parameter& parameters,
-+                                       const PotentialWindow& window, ElectronicObservables& result) const
-+{
-+    if (!this->conv_esolver || !pelec || !pelec->charge || !pelec->pot)
-+    { throw std::runtime_error("electronic observables require a converged SCF state"); }
-+    const int npool = parameters.inp.kpar * parameters.inp.bndpar;
-+    result.nelect = checked_occupation_electron_count(pelec->wg, parameters.inp.nelec,
-+                                                      npool, pw_rhod->poolnproc);
-+    result.fermi_ry = pelec->eferm.ef;
-+    if (parameters.globalv.two_fermi)
-+    {
-+        // The total-N derivative at fixed N_up-N_down is the mean spin chemical potential.
-+        result.fermi_ry = 0.5 * (pelec->eferm.ef_up + pelec->eferm.ef_dw);
-+    }
-+    if (!std::isfinite(result.fermi_ry)) { throw std::runtime_error("non-finite SCF chemical potential"); }
-+    if (window.axis >= 0)
-+    {
-+        const double* fixed = pw_rhod->nrxx > 0 ? pelec->pot->get_fixed_v() : nullptr;
-+        const auto* pcc_potential = pelec->pot->pcc_electron_potential();
-+        const auto potential = elecstate::electrostatic_potential(ucell, *pw_rhod, *pelec->charge,
-+                                                                 fixed, solvent, parameters.inp, pcc_potential);
-+        result.reference_ry = elecstate::planar_potential_average(ucell, *pw_rhod, potential, window.axis,
-+                                                                 window.minimum_A, window.maximum_A);
-+    }
-+    return true;
-+}
-+}
-diff --git a/source/source_esolver/esolver_ks.cpp b/source/source_esolver/esolver_ks.cpp
-index eac9787..fa492bf 100644
---- a/source/source_esolver/esolver_ks.cpp
-+++ b/source/source_esolver/esolver_ks.cpp
-@@ -177,6 +177,8 @@ void ESolver_KS::runner(BaseCell& basecell, const int istep)
-     ModuleBase::TITLE("ESolver_KS", "runner");
-     ModuleBase::timer::start(this->classname, "runner");
- 
-+    this->conv_esolver = false;
-+
-     // 1) before_scf (electronic iteration loops)
-     this->before_scf(ucell, istep);
-     ModuleBase::GlobalFunc::DONE(GlobalV::ofs_running, "INIT SCF");
-@@ -215,6 +217,7 @@ void ESolver_KS::runner(BaseCell& basecell, const int istep)
-     } // end scf iterations
- 
-     // 7) after scf
-+    conv_esolver = conv_esolver && !this->oscillate_esolver;
-     this->after_scf(ucell, istep, conv_esolver);
-     this->conv_esolver = conv_esolver;
- 
-diff --git a/source/source_esolver/esolver_ks_lcao.cpp b/source/source_esolver/esolver_ks_lcao.cpp
-index 268b525..ffe3850 100644
---- a/source/source_esolver/esolver_ks_lcao.cpp
-+++ b/source/source_esolver/esolver_ks_lcao.cpp
-@@ -118,6 +118,17 @@ void ESolver_KS_LCAO<TK, TR>::before_all_runners(BaseCell& basecell, const Input
- }
- 
- 
-+template <typename TK, typename TR>
-+bool ESolver_KS_LCAO<TK, TR>::apply_electronic_control(Parameter& parameters, const ElectronicControl& control)
-+{
-+    if (!ESolver_FP::apply_electronic_control(parameters, control)) { return false; }
-+#ifdef __EXX
-+    if (this->exx_nao.exd) { this->exx_nao.exd->begin_electronic_step(); }
-+    if (this->exx_nao.exc) { this->exx_nao.exc->begin_electronic_step(); }
-+#endif
-+    return true;
-+}
-+
- template <typename TK, typename TR>
- void ESolver_KS_LCAO<TK, TR>::before_scf(UnitCell& ucell, const int istep)
- {
-diff --git a/source/source_esolver/esolver_ks_lcao.h b/source/source_esolver/esolver_ks_lcao.h
-index e6d4cad..6633df3 100644
---- a/source/source_esolver/esolver_ks_lcao.h
-+++ b/source/source_esolver/esolver_ks_lcao.h
-@@ -31,6 +31,8 @@ class ESolver_KS_LCAO : public ESolver_KS
-     ESolver_KS_LCAO();
-     ~ESolver_KS_LCAO();
- 
-+    bool apply_electronic_control(Parameter& parameters, const ElectronicControl& control) override;
-+
-     void before_all_runners(BaseCell& basecell, const Input_para& inp) override;
- 
-     double cal_energy() override;
-diff --git a/source/source_esolver/esolver_ks_pw.cpp b/source/source_esolver/esolver_ks_pw.cpp
-index 0ed5011..52f9967 100644
---- a/source/source_esolver/esolver_ks_pw.cpp
-+++ b/source/source_esolver/esolver_ks_pw.cpp
-@@ -17,6 +17,7 @@
- 
- #include "source_estate/module_charge/chg_routine.h" // use charge mixing, mohan add 20251006
- #include "source_estate/setup_estate_pw.h"         // mohan add 20251005
-+#include "source_hamilt/module_xc/xc_functional.h"
- #include "source_hamilt/module_xc/general_exx_info.h" // for General_Exx_Info type used via general_exx_info_
- #include "source_io/module_ctrl/ctrl_output_pw.h"  // mohan add 20250927
- #include "source_pw/module_pwdft/deltaspin_pw.h"   // mohan add 20250309
-@@ -25,6 +26,8 @@
- #include "source_pw/module_pwdft/update_cell_pw.h" // mohan add 20250309
- #include "source_pw/module_pwdft/setup_dftu_pw.h"  // mohan add 20250309
- 
-+#include <stdexcept>
-+
- namespace ModuleESolver
- {
- 
-@@ -134,6 +137,23 @@ void ESolver_KS_PW<T, Device>::before_all_runners(BaseCell& basecell, const Inpu
-     this->exx_helper->init(ucell, inp, this->pelec->wg, this->general_exx_info_);
- }
- 
-+template <typename T, typename Device>
-+bool ESolver_KS_PW<T, Device>::apply_electronic_control(Parameter& parameters, const ElectronicControl& control)
-+{
-+    const int functional_type = XC_Functional::get_func_type();
-+    // Separate-loop SCAN0 starts as SCAN, before switching to hybrid meta-GGA.
-+    // The upstream PW density path updates tau only for non-hybrid meta-GGA.
-+    if (functional_type == 5 || (functional_type == 3 && this->general_exx_info_.cal_exx))
-+    {
-+        throw std::runtime_error(
-+            "constant-potential PW hybrid meta-GGA is unsupported: "
-+            "upstream kinetic-energy-density updates do not handle hybrid functionals");
-+    }
-+    if (!ESolver_FP::apply_electronic_control(parameters, control)) { return false; }
-+    this->exx_helper->begin_electronic_step();
-+    return true;
-+}
-+
- template <typename T, typename Device>
- void ESolver_KS_PW<T, Device>::before_scf(UnitCell& ucell, const int istep)
- {
-diff --git a/source/source_esolver/esolver_ks_pw.h b/source/source_esolver/esolver_ks_pw.h
-index 34e28bd..58ac9fa 100644
---- a/source/source_esolver/esolver_ks_pw.h
-+++ b/source/source_esolver/esolver_ks_pw.h
-@@ -34,6 +34,8 @@ class ESolver_KS_PW : public ESolver_KS
- 
-     Exx_HelperBase* exx_helper = nullptr;
- 
-+    bool apply_electronic_control(Parameter& parameters, const ElectronicControl& control) override;
-+
-   protected:
-     virtual void before_scf(UnitCell& ucell, const int istep) override;
- 
-diff --git a/source/source_esolver/test/CMakeLists.txt b/source/source_esolver/test/CMakeLists.txt
-index 2b7a04a..82a17d6 100644
---- a/source/source_esolver/test/CMakeLists.txt
-+++ b/source/source_esolver/test/CMakeLists.txt
-@@ -1,6 +1,22 @@
- abacus_disable_feature_definitions(__MPI)
- abacus_disable_feature_definitions(__LCAO)
- 
-+AddTest(
-+  TARGET MODULE_ESOLVER_electronic_occupations_test
-+  LIBS base device MPI::MPI_CXX
-+  KEEP_FEATURE_DEFINITIONS __MPI
-+  SOURCES test_electronic_occupations.cpp ../electronic_occupations.cpp
-+)
-+set_tests_properties(MODULE_ESOLVER_electronic_occupations_test
-+  PROPERTIES TIMEOUT 30 ENVIRONMENT "OMP_NUM_THREADS=1")
-+add_test(
-+  NAME MODULE_ESOLVER_electronic_occupations_mpi4_test
-+  COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
-+          $<TARGET_FILE:MODULE_ESOLVER_electronic_occupations_test> ${MPIEXEC_POSTFLAGS}
-+)
-+set_tests_properties(MODULE_ESOLVER_electronic_occupations_mpi4_test
-+  PROPERTIES TIMEOUT 30 PROCESSORS 4 ENVIRONMENT "OMP_NUM_THREADS=1")
-+
- set(_esolver_dp_test_libs
-   parameter
-   base
-diff --git a/source/source_esolver/test/test_electronic_occupations.cpp b/source/source_esolver/test/test_electronic_occupations.cpp
-new file mode 100644
-index 0000000..a4fb302
---- /dev/null
-+++ b/source/source_esolver/test/test_electronic_occupations.cpp
-@@ -0,0 +1,217 @@
-+#include "../electronic_occupations.h"
-+#include "source_base/matrix.h"
-+#include "source_base/parallel_global.h"
-+
-+#include "gtest/gtest.h"
-+
-+#include <limits>
-+#include <stdexcept>
-+
-+namespace
-+{
-+int process_count = 1;
-+int process_rank = 0;
-+
-+ModuleBase::matrix fractional_weights()
-+{
-+    ModuleBase::matrix weights(2, 3);
-+    weights(0, 0) = 2.0;
-+    weights(0, 1) = 2.0;
-+    weights(0, 2) = 2.0;
-+    weights(1, 0) = 2.0;
-+    weights(1, 1) = 0.2;
-+    return weights;
-+}
-+
-+TEST(ElectronicOccupations, FractionalPopulationIncludesEveryLocalRowAndBand)
-+{
-+    const ModuleBase::matrix weights = fractional_weights();
-+    EXPECT_NEAR(8.2, ModuleESolver::checked_occupation_electron_count(weights, 8.2, 1, process_count), 1e-14);
-+}
-+
-+TEST(ElectronicOccupations, ReturnsOccupationSumInsteadOfEchoingNearbyRequest)
-+{
-+    const ModuleBase::matrix weights = fractional_weights();
-+    const double requested = 8.2 + 5e-9;
-+    const double actual = ModuleESolver::checked_occupation_electron_count(weights, requested, 1, process_count);
-+    EXPECT_NEAR(8.2, actual, 1e-14);
-+    EXPECT_GT(requested - actual, 4e-9);
-+}
-+
-+TEST(ElectronicOccupations, RejectsPopulationMismatchOnEitherSide)
-+{
-+    const ModuleBase::matrix weights = fractional_weights();
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2 + 2e-8, 1, process_count),
-+                 std::runtime_error);
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2 - 2e-8, 1, process_count),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, ToleranceIsAbsoluteEvenForLargeElectronCounts)
-+{
-+    ModuleBase::matrix weights(1, 1);
-+    weights(0, 0) = 1e6;
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 1e6 + 1e-6, 1, process_count),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, GeneralizedSmearingCanContainNegativeWeights)
-+{
-+    ModuleBase::matrix weights(1, 3);
-+    weights(0, 0) = 2.125;
-+    weights(0, 1) = -0.25;
-+    weights(0, 2) = 0.125;
-+    EXPECT_DOUBLE_EQ(2.0, ModuleESolver::checked_occupation_electron_count(weights, 2.0, 1, process_count));
-+}
-+
-+TEST(ElectronicOccupations, RejectsNaNOnLastRankTogether)
-+{
-+    ModuleBase::matrix weights = fractional_weights();
-+    if (process_rank == process_count - 1)
-+    {
-+        weights(1, 2) = std::numeric_limits<double>::quiet_NaN();
-+    }
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, 1, process_count),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, RejectsInfinityOnLastRankTogether)
-+{
-+    ModuleBase::matrix weights = fractional_weights();
-+    if (process_rank == process_count - 1)
-+    {
-+        weights(1, 2) = std::numeric_limits<double>::infinity();
-+    }
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, 1, process_count),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, RejectsLocalOverflowBeforePoolReduction)
-+{
-+    ModuleBase::matrix weights(1, 2);
-+    weights(0, 0) = std::numeric_limits<double>::max();
-+    weights(0, 1) = std::numeric_limits<double>::max();
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, process_count, 1),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, RejectsInvalidRequestOnLastRankTogether)
-+{
-+    const ModuleBase::matrix weights = fractional_weights();
-+    const double requested = process_rank == process_count - 1 ? std::numeric_limits<double>::quiet_NaN() : 8.2;
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, requested, 1, process_count),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, RejectsInvalidPartitionOnLastRankTogether)
-+{
-+    const ModuleBase::matrix weights = fractional_weights();
-+    const int local_size = process_rank == process_count - 1 ? 0 : process_count;
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, 1, local_size), std::runtime_error);
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, 0, process_count), std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, SinglePoolDoesNotMultiplyReplicatedPopulationByRankCount)
-+{
-+    const ModuleBase::matrix weights = fractional_weights();
-+    EXPECT_NEAR(8.2, ModuleESolver::checked_occupation_electron_count(weights, 8.2, 1, process_count), 1e-14);
-+}
-+
-+TEST(ElectronicOccupations, SinglePoolMismatchOnOneReplicaFailsEveryRank)
-+{
-+    ModuleBase::matrix weights = fractional_weights();
-+    if (process_rank == process_count - 1)
-+    {
-+        weights(1, 1) += 0.125;
-+    }
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, 1, process_count),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, KPointPoolsCombineDistinctRowsAndRemovePoolReplicas)
-+{
-+    const int pools = process_count % 2 == 0 ? 2 : 1;
-+    const int ranks_per_pool = process_count / pools;
-+    const int pool = process_rank / ranks_per_pool;
-+    ModuleBase::matrix weights(1, 2);
-+    const double population = pools == 1 ? 8.2 : (pool == 0 ? 2.2 : 6.0);
-+    weights(0, 0) = 0.25 * population;
-+    weights(0, 1) = 0.75 * population;
-+    EXPECT_NEAR(8.2, ModuleESolver::checked_occupation_electron_count(weights, 8.2, pools, ranks_per_pool), 1e-14);
-+}
-+
-+TEST(ElectronicOccupations, BandShardsUseLocalColumnCount)
-+{
-+    // Independent band shards are reduction groups, just like native BNDPAR.
-+    const int local_bands = process_rank + 1;
-+    ModuleBase::matrix weights(2, local_bands);
-+    const double total_bands = process_count * (process_count + 1) / 2.0;
-+    for (int band = 0; band < local_bands; ++band)
-+    {
-+        weights(0, band) = 3.0 / total_bands;
-+        weights(1, band) = 5.2 / total_bands;
-+    }
-+    EXPECT_NEAR(8.2, ModuleESolver::checked_occupation_electron_count(weights, 8.2, process_count, 1), 1e-14);
-+}
-+
-+TEST(ElectronicOccupations, EmptyLocalBlocksStillParticipateInCollectives)
-+{
-+    ModuleBase::matrix weights;
-+    if (process_rank == 0)
-+    {
-+        weights = fractional_weights();
-+    }
-+    EXPECT_NEAR(8.2, ModuleESolver::checked_occupation_electron_count(weights, 8.2, process_count, 1), 1e-14);
-+}
-+
-+TEST(ElectronicOccupations, EmptyPopulationCannotSatisfyPositiveRequest)
-+{
-+    const ModuleBase::matrix weights;
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, process_count, 1),
-+                 std::runtime_error);
-+}
-+
-+TEST(ElectronicOccupations, UnequalPoolSizesRemoveTheirOwnReplicaCounts)
-+{
-+    // One rank in the first pool and all remaining ranks in the second.
-+    const int pools = process_count > 1 ? 2 : 1;
-+    const int ranks_per_pool = process_rank == 0 ? 1 : process_count - 1;
-+    ModuleBase::matrix weights(1, 1);
-+    weights(0, 0) = pools == 1 ? 8.2 : (process_rank == 0 ? 2.2 : 6.0);
-+    EXPECT_NEAR(8.2, ModuleESolver::checked_occupation_electron_count(weights, 8.2, pools, ranks_per_pool), 1e-14);
-+}
-+
-+TEST(ElectronicOccupations, RemoteInvalidEntryCannotBeHiddenByAnEmptyRootBlock)
-+{
-+    ModuleBase::matrix weights;
-+    if (process_rank == process_count - 1)
-+    {
-+        weights.create(1, 1);
-+        weights(0, 0) = -std::numeric_limits<double>::infinity();
-+    }
-+    EXPECT_THROW(ModuleESolver::checked_occupation_electron_count(weights, 8.2, process_count, 1),
-+                 std::runtime_error);
-+}
-+} // namespace
-+
-+int main(int argc, char** argv)
-+{
-+    int thread_count = 1;
-+    Parallel_Global::read_pal_param(argc, argv, process_count, thread_count, process_rank);
-+#ifdef __MPI
-+    // Follow source_base/test/mpi_test_main.cpp: no pool communicators are
-+    // created by these tests, so native finalization must not free them.
-+    POOL_WORLD = MPI_COMM_NULL;
-+    KP_WORLD = MPI_COMM_NULL;
-+    INT_BGROUP = MPI_COMM_NULL;
-+    BP_WORLD = MPI_COMM_NULL;
-+    GRID_WORLD = MPI_COMM_NULL;
-+    DIAG_WORLD = MPI_COMM_NULL;
-+#endif
-+    testing::InitGoogleTest(&argc, argv);
-+    const int result = RUN_ALL_TESTS();
-+#ifdef __MPI
-+    Parallel_Global::finalize_mpi();
-+#endif
-+    return result;
-+}
-diff --git a/source/source_estate/CMakeLists.txt b/source/source_estate/CMakeLists.txt
-index 15c09ac..fbb5d1f 100644
---- a/source/source_estate/CMakeLists.txt
-+++ b/source/source_estate/CMakeLists.txt
-@@ -17,6 +17,7 @@ list(APPEND objects
-     module_pot/gatefield.cpp
-     module_pot/efield.cpp
-     module_pot/h_hartree_pw.cpp
-+    module_pot/electrostatic_potential.cpp
-     module_pot/h_tddft_pw.cpp
-     module_pot/pot_xc.cpp
-     module_pot/pot_local.cpp
 diff --git a/source/source_estate/module_pot/electrostatic_potential.cpp b/source/source_estate/module_pot/electrostatic_potential.cpp
 new file mode 100644
-index 0000000..6effd71
+index 000000000..933ebb7ee
 --- /dev/null
 +++ b/source/source_estate/module_pot/electrostatic_potential.cpp
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,106 @@
 +#include "electrostatic_potential.h"
++#include "potential_new.h"
++#include "source_estate/electronic_control.h"
 +#include "h_hartree_pw.h"
 +#include "efield.h"
 +#include "source_base/module_parallel/para_mpi_func.h"
@@ -757,13 +481,29 @@ index 0000000..6effd71
 +
 +namespace elecstate
 +{
++double electrostatic_reference(const UnitCell& cell, ModulePW::PW_Basis& basis,
++                               const Charge& charge, const Potential& pot,
++                               const surchem& solvent, const Input_para& input,
++                               const PotentialWindow& window)
++{
++    const double* fixed = basis.nrxx > 0 ? pot.get_fixed_v() : nullptr;
++    const auto* pcc_potential = pot.pcc_electron_potential();
++    const auto* solvent_potential = pot.find_sol_pot();
++    const auto potential = electrostatic_potential(cell, basis, charge, fixed, solvent, input,
++                                                   pcc_potential, solvent_potential);
++    return planar_potential_average(cell, basis, potential, window.axis, window.minimum_A, window.maximum_A);
++}
++
 +std::vector<double> electrostatic_potential(const UnitCell& cell, ModulePW::PW_Basis& basis,
 +                                           const Charge& charge, const double* fixed,
 +                                           const surchem& solvent, const Input_para& input,
-+                                           const std::vector<double>* pcc_potential)
++                                           const std::vector<double>* pcc_potential,
++                                           const std::vector<double>* solvent_potential)
 +{
-+    if (basis.nrxx > 0 && (!fixed || (input.imp_sol && !solvent.delta_phi)))
++    if (basis.nrxx > 0 && (!fixed || (input.imp_sol == 1 && !solvent.delta_phi)))
 +    { throw std::runtime_error("electrostatic reference requires initialized fixed and solvent potentials"); }
++    if (solvent_potential && solvent_potential->size() != static_cast<std::size_t>(basis.nrxx))
++    { throw std::runtime_error("Solvent potential does not match the output grid"); }
 +    const auto hartree = H_Hartree_pw::v_hartree(cell, &basis, input.nspin, charge.rho);
 +    ModuleBase::matrix dipole;
 +    const bool add_dipole = input.efield_flag && input.dip_cor_flag;
@@ -775,7 +515,8 @@ index 0000000..6effd71
 +        potential[ir] = hartree(0, ir) + fixed[ir];
 +        if (add_dipole) { potential[ir] += dipole(0, ir); }
 +        if (pcc_potential) { potential[ir] += (*pcc_potential)[ir]; }
-+        if (input.imp_sol) { potential[ir] += solvent.delta_phi[ir]; }
++        if (solvent_potential) { potential[ir] += (*solvent_potential)[ir]; }
++        if (input.imp_sol == 1) { potential[ir] += solvent.delta_phi[ir]; }
 +    }
 +    return potential;
 +}
@@ -832,10 +573,10 @@ index 0000000..6effd71
 +}
 diff --git a/source/source_estate/module_pot/electrostatic_potential.h b/source/source_estate/module_pot/electrostatic_potential.h
 new file mode 100644
-index 0000000..1e1f2c6
+index 000000000..64dcbc43b
 --- /dev/null
 +++ b/source/source_estate/module_pot/electrostatic_potential.h
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,30 @@
 +#ifndef ABACUS_ELECTROSTATIC_POTENTIAL_H
 +#define ABACUS_ELECTROSTATIC_POTENTIAL_H
 +
@@ -848,18 +589,26 @@ index 0000000..1e1f2c6
 +
 +namespace elecstate
 +{
++class Potential;
++struct PotentialWindow;
++double electrostatic_reference(const UnitCell& cell, ModulePW::PW_Basis& basis,
++                               const Charge& charge, const Potential& pot,
++                               const surchem& solvent, const Input_para& input,
++                               const PotentialWindow& window);
++
 +// Same local electrostatic reference for cube output and electronic observables.
 +std::vector<double> electrostatic_potential(const UnitCell& cell, ModulePW::PW_Basis& basis,
 +                                           const Charge& charge, const double* fixed,
 +                                           const surchem& solvent, const Input_para& input,
-+                                           const std::vector<double>* pcc_potential);
++                                           const std::vector<double>* pcc_potential,
++                                           const std::vector<double>* solvent_potential);
 +double planar_potential_average(const UnitCell& cell, const ModulePW::PW_Basis& basis,
 +                                const std::vector<double>& potential, int axis,
 +                                double minimum_A, double maximum_A);
 +}
 +#endif
 diff --git a/source/source_estate/param_update.cpp b/source/source_estate/param_update.cpp
-index 3ff8094..90c5c30 100644
+index 3ff809496..90c5c30cc 100644
 --- a/source/source_estate/param_update.cpp
 +++ b/source/source_estate/param_update.cpp
 @@ -14,4 +14,9 @@ void ParamUpdater::update_from_atoms_info(const AtomsInfoResult& atoms_info)
@@ -875,7 +624,7 @@ index 3ff8094..90c5c30 100644
 +
 +}
 diff --git a/source/source_estate/param_update.h b/source/source_estate/param_update.h
-index 89a0d90..d63f387 100644
+index 89a0d9002..d63f38705 100644
 --- a/source/source_estate/param_update.h
 +++ b/source/source_estate/param_update.h
 @@ -3,13 +3,16 @@
@@ -897,14 +646,31 @@ index 89a0d90..d63f387 100644
 -#endif
 \ No newline at end of file
 +#endif
-diff --git a/source/source_estate/test/CMakeLists.txt b/source/source_estate/test/CMakeLists.txt
-index a39b330..7dd72f5 100644
---- a/source/source_estate/test/CMakeLists.txt
-+++ b/source/source_estate/test/CMakeLists.txt
-@@ -27,6 +27,22 @@ AddTest(
+diff --git a/source/source_estate/unittests/CMakeLists.txt b/source/source_estate/unittests/CMakeLists.txt
+index 3a565c9ab..6128737fa 100644
+--- a/source/source_estate/unittests/CMakeLists.txt
++++ b/source/source_estate/unittests/CMakeLists.txt
+@@ -27,6 +27,39 @@ AddTest(
  
  if (ENABLE_MPI)
  
++AddTest(
++  TARGET MODULE_ESTATE_electronic_occupations_test
++  LIBS base device MPI::MPI_CXX
++  KEEP_FEATURE_DEFINITIONS __MPI
++  SOURCES test_electronic_occupations.cpp ../electronic_occupations.cpp
++)
++set_tests_properties(MODULE_ESTATE_electronic_occupations_test
++  PROPERTIES TIMEOUT 30 ENVIRONMENT "OMP_NUM_THREADS=1")
++add_test(
++  NAME MODULE_ESTATE_electronic_occupations_mpi4_test
++  COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
++          $<TARGET_FILE:MODULE_ESTATE_electronic_occupations_test> ${MPIEXEC_POSTFLAGS}
++)
++set_tests_properties(MODULE_ESTATE_electronic_occupations_mpi4_test
++  PROPERTIES TIMEOUT 30 PROCESSORS 4 ENVIRONMENT "OMP_NUM_THREADS=1")
++
++
 +AddTest(
 +  TARGET MODULE_ESTATE_electrostatic_potential_test
 +  LIBS parameter base device planewave MPI::MPI_CXX
@@ -922,18 +688,280 @@ index a39b330..7dd72f5 100644
 +  PROPERTIES TIMEOUT 30 PROCESSORS 4 ENVIRONMENT "OMP_NUM_THREADS=1")
 +
  set(pcc_test_sources
+     ../module_pot/sccs_output.cpp
      ../module_pot/pot_pcc.cpp ../pcc_0d.cpp ../pcc_2d.cpp ../charge_moments.cpp
-     ../../source_cell/cell_geometry.cpp ../../source_cell/cell_tools.cpp
-diff --git a/source/source_estate/test/test_electrostatic_potential.cpp b/source/source_estate/test/test_electrostatic_potential.cpp
+diff --git a/source/source_estate/unittests/test_elecstate.cpp b/source/source_estate/unittests/test_elecstate.cpp
+index 317ef2805..5d1578752 100644
+--- a/source/source_estate/unittests/test_elecstate.cpp
++++ b/source/source_estate/unittests/test_elecstate.cpp
+@@ -213,6 +213,32 @@ TEST_F(ElecStateTest, InitNelecSpin)
+     EXPECT_EQ(elecstate->nelec_spin[1], 5.0);
+ }
+ 
++TEST_F(ElecStateTest, ElectronicRequestUsesExplicitSpinState)
++{
++    // The fixture uses global N=10, nspin=1 and two_fermi=false.
++    elecstate::update_electron_count(*elecstate, 8.2, 2, 0.2, true);
++    ASSERT_EQ(elecstate->nelec_spin.size(), 2u);
++    EXPECT_NEAR(elecstate->nelec_spin[0], 4.2, 1e-14);
++    EXPECT_NEAR(elecstate->nelec_spin[1], 4.0, 1e-14);
++    EXPECT_TRUE(elecstate->eferm.two_efermi);
++
++    elecstate::update_electron_count(*elecstate, 7.8, 2, -0.2, false);
++    EXPECT_NEAR(elecstate->nelec_spin[0], 3.8, 1e-14);
++    EXPECT_NEAR(elecstate->nelec_spin[1], 4.0, 1e-14);
++    EXPECT_FALSE(elecstate->eferm.two_efermi);
++
++    elecstate::update_electron_count(*elecstate, 8.0, 2, 0.0, true);
++    EXPECT_DOUBLE_EQ(elecstate->nelec_spin[0], 4.0);
++    EXPECT_DOUBLE_EQ(elecstate->nelec_spin[1], 4.0);
++    EXPECT_TRUE(elecstate->eferm.two_efermi);
++
++    // The explicit path must leave the native parameter source unchanged.
++    TestParameters::set_nspin(2);
++    elecstate->init_nelec_spin();
++    EXPECT_DOUBLE_EQ(elecstate->nelec_spin[0], 5.0);
++    EXPECT_DOUBLE_EQ(elecstate->nelec_spin[1], 5.0);
++}
++
+ TEST_F(ElecStateTest, Constructor)
+ {
+     Charge* charge = new Charge;
+diff --git a/source/source_estate/unittests/test_electronic_occupations.cpp b/source/source_estate/unittests/test_electronic_occupations.cpp
 new file mode 100644
-index 0000000..942b5fb
+index 000000000..38fd39259
 --- /dev/null
-+++ b/source/source_estate/test/test_electrostatic_potential.cpp
-@@ -0,0 +1,163 @@
++++ b/source/source_estate/unittests/test_electronic_occupations.cpp
+@@ -0,0 +1,217 @@
++#include "../electronic_occupations.h"
++#include "source_base/matrix.h"
++#include "source_base/parallel_global.h"
++
++#include "gtest/gtest.h"
++
++#include <limits>
++#include <stdexcept>
++
++namespace
++{
++int process_count = 1;
++int process_rank = 0;
++
++ModuleBase::matrix fractional_weights()
++{
++    ModuleBase::matrix weights(2, 3);
++    weights(0, 0) = 2.0;
++    weights(0, 1) = 2.0;
++    weights(0, 2) = 2.0;
++    weights(1, 0) = 2.0;
++    weights(1, 1) = 0.2;
++    return weights;
++}
++
++TEST(ElectronicOccupations, FractionalPopulationIncludesEveryLocalRowAndBand)
++{
++    const ModuleBase::matrix weights = fractional_weights();
++    EXPECT_NEAR(8.2, elecstate::checked_occupation_electron_count(weights, 8.2, 1, process_count), 1e-14);
++}
++
++TEST(ElectronicOccupations, ReturnsOccupationSumInsteadOfEchoingNearbyRequest)
++{
++    const ModuleBase::matrix weights = fractional_weights();
++    const double requested = 8.2 + 5e-9;
++    const double actual = elecstate::checked_occupation_electron_count(weights, requested, 1, process_count);
++    EXPECT_NEAR(8.2, actual, 1e-14);
++    EXPECT_GT(requested - actual, 4e-9);
++}
++
++TEST(ElectronicOccupations, RejectsPopulationMismatchOnEitherSide)
++{
++    const ModuleBase::matrix weights = fractional_weights();
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2 + 2e-8, 1, process_count),
++                 std::runtime_error);
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2 - 2e-8, 1, process_count),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, ToleranceIsAbsoluteEvenForLargeElectronCounts)
++{
++    ModuleBase::matrix weights(1, 1);
++    weights(0, 0) = 1e6;
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 1e6 + 1e-6, 1, process_count),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, GeneralizedSmearingCanContainNegativeWeights)
++{
++    ModuleBase::matrix weights(1, 3);
++    weights(0, 0) = 2.125;
++    weights(0, 1) = -0.25;
++    weights(0, 2) = 0.125;
++    EXPECT_DOUBLE_EQ(2.0, elecstate::checked_occupation_electron_count(weights, 2.0, 1, process_count));
++}
++
++TEST(ElectronicOccupations, RejectsNaNOnLastRankTogether)
++{
++    ModuleBase::matrix weights = fractional_weights();
++    if (process_rank == process_count - 1)
++    {
++        weights(1, 2) = std::numeric_limits<double>::quiet_NaN();
++    }
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, 1, process_count),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, RejectsInfinityOnLastRankTogether)
++{
++    ModuleBase::matrix weights = fractional_weights();
++    if (process_rank == process_count - 1)
++    {
++        weights(1, 2) = std::numeric_limits<double>::infinity();
++    }
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, 1, process_count),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, RejectsLocalOverflowBeforePoolReduction)
++{
++    ModuleBase::matrix weights(1, 2);
++    weights(0, 0) = std::numeric_limits<double>::max();
++    weights(0, 1) = std::numeric_limits<double>::max();
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, process_count, 1),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, RejectsInvalidRequestOnLastRankTogether)
++{
++    const ModuleBase::matrix weights = fractional_weights();
++    const double requested = process_rank == process_count - 1 ? std::numeric_limits<double>::quiet_NaN() : 8.2;
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, requested, 1, process_count),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, RejectsInvalidPartitionOnLastRankTogether)
++{
++    const ModuleBase::matrix weights = fractional_weights();
++    const int local_size = process_rank == process_count - 1 ? 0 : process_count;
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, 1, local_size), std::runtime_error);
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, 0, process_count), std::runtime_error);
++}
++
++TEST(ElectronicOccupations, SinglePoolDoesNotMultiplyReplicatedPopulationByRankCount)
++{
++    const ModuleBase::matrix weights = fractional_weights();
++    EXPECT_NEAR(8.2, elecstate::checked_occupation_electron_count(weights, 8.2, 1, process_count), 1e-14);
++}
++
++TEST(ElectronicOccupations, SinglePoolMismatchOnOneReplicaFailsEveryRank)
++{
++    ModuleBase::matrix weights = fractional_weights();
++    if (process_rank == process_count - 1)
++    {
++        weights(1, 1) += 0.125;
++    }
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, 1, process_count),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, KPointPoolsCombineDistinctRowsAndRemovePoolReplicas)
++{
++    const int pools = process_count % 2 == 0 ? 2 : 1;
++    const int ranks_per_pool = process_count / pools;
++    const int pool = process_rank / ranks_per_pool;
++    ModuleBase::matrix weights(1, 2);
++    const double population = pools == 1 ? 8.2 : (pool == 0 ? 2.2 : 6.0);
++    weights(0, 0) = 0.25 * population;
++    weights(0, 1) = 0.75 * population;
++    EXPECT_NEAR(8.2, elecstate::checked_occupation_electron_count(weights, 8.2, pools, ranks_per_pool), 1e-14);
++}
++
++TEST(ElectronicOccupations, BandShardsUseLocalColumnCount)
++{
++    // Independent band shards are reduction groups, just like native BNDPAR.
++    const int local_bands = process_rank + 1;
++    ModuleBase::matrix weights(2, local_bands);
++    const double total_bands = process_count * (process_count + 1) / 2.0;
++    for (int band = 0; band < local_bands; ++band)
++    {
++        weights(0, band) = 3.0 / total_bands;
++        weights(1, band) = 5.2 / total_bands;
++    }
++    EXPECT_NEAR(8.2, elecstate::checked_occupation_electron_count(weights, 8.2, process_count, 1), 1e-14);
++}
++
++TEST(ElectronicOccupations, EmptyLocalBlocksStillParticipateInCollectives)
++{
++    ModuleBase::matrix weights;
++    if (process_rank == 0)
++    {
++        weights = fractional_weights();
++    }
++    EXPECT_NEAR(8.2, elecstate::checked_occupation_electron_count(weights, 8.2, process_count, 1), 1e-14);
++}
++
++TEST(ElectronicOccupations, EmptyPopulationCannotSatisfyPositiveRequest)
++{
++    const ModuleBase::matrix weights;
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, process_count, 1),
++                 std::runtime_error);
++}
++
++TEST(ElectronicOccupations, UnequalPoolSizesRemoveTheirOwnReplicaCounts)
++{
++    // One rank in the first pool and all remaining ranks in the second.
++    const int pools = process_count > 1 ? 2 : 1;
++    const int ranks_per_pool = process_rank == 0 ? 1 : process_count - 1;
++    ModuleBase::matrix weights(1, 1);
++    weights(0, 0) = pools == 1 ? 8.2 : (process_rank == 0 ? 2.2 : 6.0);
++    EXPECT_NEAR(8.2, elecstate::checked_occupation_electron_count(weights, 8.2, pools, ranks_per_pool), 1e-14);
++}
++
++TEST(ElectronicOccupations, RemoteInvalidEntryCannotBeHiddenByAnEmptyRootBlock)
++{
++    ModuleBase::matrix weights;
++    if (process_rank == process_count - 1)
++    {
++        weights.create(1, 1);
++        weights(0, 0) = -std::numeric_limits<double>::infinity();
++    }
++    EXPECT_THROW(elecstate::checked_occupation_electron_count(weights, 8.2, process_count, 1),
++                 std::runtime_error);
++}
++} // namespace
++
++int main(int argc, char** argv)
++{
++    int thread_count = 1;
++    Parallel_Global::read_pal_param(argc, argv, process_count, thread_count, process_rank);
++#ifdef __MPI
++    // Follow source_base/test/mpi_test_main.cpp: no pool communicators are
++    // created by these tests, so native finalization must not free them.
++    POOL_WORLD = MPI_COMM_NULL;
++    KP_WORLD = MPI_COMM_NULL;
++    INT_BGROUP = MPI_COMM_NULL;
++    BP_WORLD = MPI_COMM_NULL;
++    GRID_WORLD = MPI_COMM_NULL;
++    DIAG_WORLD = MPI_COMM_NULL;
++#endif
++    testing::InitGoogleTest(&argc, argv);
++    const int result = RUN_ALL_TESTS();
++#ifdef __MPI
++    Parallel_Global::finalize_mpi();
++#endif
++    return result;
++}
+diff --git a/source/source_estate/unittests/test_electrostatic_potential.cpp b/source/source_estate/unittests/test_electrostatic_potential.cpp
+new file mode 100644
+index 000000000..d7058c4f8
+--- /dev/null
++++ b/source/source_estate/unittests/test_electrostatic_potential.cpp
+@@ -0,0 +1,234 @@
 +#include "source_estate/module_pot/electrostatic_potential.h"
++#include "source_estate/module_pot/potential_new.h"
 +#include "source_estate/module_pot/efield.h"
 +#include "source_estate/module_pot/h_hartree_pw.h"
 +#include "source_base/parallel_global.h"
++#include "source_io/module_parameter/input_parameter.h"
 +
 +#include <gtest/gtest.h>
 +#include <algorithm>
@@ -949,18 +977,34 @@ index 0000000..942b5fb
 +SepPot::~SepPot() {}
 +Sep_Cell::Sep_Cell() noexcept {}
 +Sep_Cell::~Sep_Cell() noexcept {}
++Charge::Charge() {}
++Charge::~Charge() {}
++surchem::surchem() {}
++surchem::~surchem() {}
 +
-+// The same production translation unit also constructs potentials. These
-+// dependencies must remain unused: the tests supply a hand-computed grid.
++// A constant Hartree term isolates the assembly of the local potentials.
++// The averaging tests supply their grid directly.
 +ModuleBase::matrix elecstate::H_Hartree_pw::v_hartree(
-+    const UnitCell&, ModulePW::PW_Basis*, const int&, const double* const* const)
++    const UnitCell&, ModulePW::PW_Basis* basis, const int& nspin, const double* const* const)
 +{
-+    throw std::logic_error("unexpected Hartree construction in averaging test");
++    ModuleBase::matrix hartree(nspin, basis->nrxx);
++    for (int ir = 0; ir < basis->nrxx; ++ir) { hartree(0, ir) = 2.0; }
++    return hartree;
 +}
 +ModuleBase::matrix elecstate::Efield::add_efield(
 +    const UnitCell&, const ModulePW::PW_Basis*, const int&, const double* const* const, const surchem&)
 +{
 +    throw std::logic_error("unexpected dipole construction in averaging test");
++}
++
++const std::vector<double>* elecstate::Potential::pcc_electron_potential() const
++{
++    throw std::logic_error("unexpected PCC construction in averaging test");
++}
++
++const std::vector<double>* elecstate::Potential::find_sol_pot() const
++{
++    throw std::logic_error("unexpected solvation construction in averaging test");
 +}
 +
 +namespace
@@ -1013,6 +1057,59 @@ index 0000000..942b5fb
 +    ModulePW::PW_Basis basis;
 +    std::vector<double> potential;
 +};
++
++TEST_F(ElectrostaticPotentialTest, SccsAndPccAreAddedOnce)
++{
++    set_grid(5);
++    Input_para input;
++    input.nspin = 1;
++    input.imp_sol = 2;
++    Charge charge;
++    surchem solvent;
++    const std::vector<double> fixed(basis.nrxx, 3.0);
++    const std::vector<double> pcc(basis.nrxx, 0.25);
++    const std::vector<double> sccs(basis.nrxx, 0.5);
++    // SCCS does not initialize the legacy delta_phi array.
++    ASSERT_EQ(solvent.delta_phi, nullptr);
++    const auto result = elecstate::electrostatic_potential(cell, basis, charge, fixed.data(), solvent,
++                                                          input, &pcc, &sccs);
++    ASSERT_EQ(result.size(), static_cast<std::size_t>(basis.nrxx));
++    for (const double value : result) { EXPECT_DOUBLE_EQ(value, 5.75); }
++}
++
++TEST_F(ElectrostaticPotentialTest, LegacySolventAndVacuumRemainUnchanged)
++{
++    set_grid(5);
++    Input_para input;
++    input.nspin = 1;
++    Charge charge;
++    surchem solvent;
++    const std::vector<double> fixed(basis.nrxx, 3.0);
++    std::vector<double> delta_phi(basis.nrxx, 0.75);
++    solvent.delta_phi = delta_phi.data();
++    for (int model = 0; model <= 1; ++model)
++    {
++        input.imp_sol = model;
++        const auto result = elecstate::electrostatic_potential(cell, basis, charge, fixed.data(), solvent,
++                                                              input, nullptr, nullptr);
++        const double expected = model == 0 ? 5.0 : 5.75;
++        for (const double value : result) { EXPECT_DOUBLE_EQ(value, expected); }
++    }
++}
++
++TEST_F(ElectrostaticPotentialTest, SolventGridMismatchIsRejected)
++{
++    set_grid(5);
++    Input_para input;
++    input.nspin = 1;
++    input.imp_sol = 2;
++    Charge charge;
++    surchem solvent;
++    const std::vector<double> fixed(basis.nrxx, 3.0);
++    const std::vector<double> wrong_grid(basis.nrxx + 1, 0.5);
++    EXPECT_THROW(elecstate::electrostatic_potential(cell, basis, charge, fixed.data(), solvent,
++                                                  input, nullptr, &wrong_grid), std::runtime_error);
++}
 +
 +TEST_F(ElectrostaticPotentialTest, HalfOpenWindowsOnAllAxes)
 +{
@@ -1094,7 +1191,7 @@ index 0000000..942b5fb
 +    return result;
 +}
 diff --git a/source/source_estate/write_elecstat_pot.cpp b/source/source_estate/write_elecstat_pot.cpp
-index 5f0d0d6..34d5e88 100644
+index f530c3d3d..68fc265cd 100644
 --- a/source/source_estate/write_elecstat_pot.cpp
 +++ b/source/source_estate/write_elecstat_pot.cpp
 @@ -1,8 +1,7 @@
@@ -1107,16 +1204,21 @@ index 5f0d0d6..34d5e88 100644
  #include "source_io/module_output/cube_io.h"
  #include "source_io/module_output/output_log.h"
  #include "write_elecstat_pot.h"
-@@ -29,54 +28,8 @@ void write_elecstat_pot(
+@@ -30,63 +29,9 @@ void write_elecstat_pot(
      ModuleBase::TITLE("ModuleIO", "write_elecstat_pot");
      ModuleBase::timer::start("ModuleIO", "write_elecstat_pot");
  
 -    std::vector<double> v_elecstat(rho_basis->nrxx, 0.0);
 -
+-    if (solvent_potential != nullptr && solvent_potential->size() != static_cast<std::size_t>(rho_basis->nrxx))
+-    {
+-        ModuleBase::WARNING_QUIT("write_elecstat_pot", "Solvent potential does not match the output grid");
+-    }
+-
 -    const int nspin = PARAM.inp.nspin;
 -    const int efield = PARAM.inp.efield_flag;
 -    const int dip_corr = PARAM.inp.dip_cor_flag;
--    const bool imp_sol = PARAM.inp.imp_sol;
+-    const int imp_sol = PARAM.inp.imp_sol;
 -
 -    //==========================================
 -    // Hartree potential
@@ -1154,17 +1256,22 @@ index 5f0d0d6..34d5e88 100644
 -        {
 -            v_elecstat[ir] += (*pcc_potential)[ir];
 -        }
--        if(imp_sol == true)
+-        if (solvent_potential != nullptr)
+-        {
+-            v_elecstat[ir] += (*solvent_potential)[ir];
+-        }
+-        if (imp_sol == 1)
 -        {
 -            v_elecstat[ir] += solvent.delta_phi[ir];
 -        }
 -    }
 +    auto v_elecstat = elecstate::electrostatic_potential(*ucell, *rho_basis, *chr,
-+                                                       v_eff, solvent, PARAM.inp, pcc_potential);
++                                                       v_eff, solvent, PARAM.inp,
++                                                       pcc_potential, solvent_potential);
  
      //-------------------------------------------
      //! Get the vacuum level of the system
-@@ -103,7 +56,7 @@ void write_elecstat_pot(
+@@ -113,7 +58,7 @@ void write_elecstat_pot(
      ModuleIO::write_vdata_palgrid(*chr->pgrid,
          v_elecstat.data(),
          is,
@@ -1173,11 +1280,24 @@ index 5f0d0d6..34d5e88 100644
          istep,
          fn,
          ef_tmp,
+diff --git a/source/source_hsolver/unittests/hsolver_supplementary_mock.h b/source/source_hsolver/unittests/hsolver_supplementary_mock.h
+index 6d216e7ec..3b10abc1e 100644
+--- a/source/source_hsolver/unittests/hsolver_supplementary_mock.h
++++ b/source/source_hsolver/unittests/hsolver_supplementary_mock.h
+@@ -15,6 +15,8 @@ const double *ElecState::getRho(int spin) const
+ 
+ void ElecState::init_nelec_spin() { return; }
+ 
++void ElecState::init_nelec_spin(int, double, double) {}
++
+ void ElecState::init_ks(
+     Charge *chg_in, // pointer for class Charge
+     const K_Vectors *klist_in,
 diff --git a/source/source_io/module_parameter/read_inp_sys.cpp b/source/source_io/module_parameter/read_inp_sys.cpp
-index a0ba7ff..5cebf90 100644
+index 51c8d95a8..791ce76e7 100644
 --- a/source/source_io/module_parameter/read_inp_sys.cpp
 +++ b/source/source_io/module_parameter/read_inp_sys.cpp
-@@ -219,7 +219,11 @@ void ReadInput::item_system()
+@@ -222,7 +222,11 @@ void ReadInput::item_system()
  When using the ASE AbacusSocketIO interface, this environment variable is set automatically from the port or unixsocket calculator argument.)";
          item.description += R"(
  
@@ -1190,7 +1310,7 @@ index a0ba7ff..5cebf90 100644
          item.default_value = "False";
          read_sync_bool(input.socket_driver);
          item.check_value = [](const Input_Item& item, const Parameter& para) {
-@@ -294,7 +298,7 @@ Socket mode always computes energy. Force and stress extraction follows cal_forc
+@@ -340,7 +344,7 @@ Socket mode always computes energy. Force and stress extraction follows cal_forc
                  {
                      para.input.symmetry = "-1";
                  }
@@ -1200,10 +1320,10 @@ index a0ba7ff..5cebf90 100644
                  {
                      para.input.symmetry = "0"; // if md or exx, symmetry will be
 diff --git a/source/source_io/test_serial/read_input_item_test.cpp b/source/source_io/test_serial/read_input_item_test.cpp
-index 4ace2f6..16ee7dd 100644
+index e66274bc7..1aeb96f4e 100644
 --- a/source/source_io/test_serial/read_input_item_test.cpp
 +++ b/source/source_io/test_serial/read_input_item_test.cpp
-@@ -271,6 +271,14 @@ TEST_F(InputTest, Item_test)
+@@ -375,6 +375,14 @@ TEST_F(InputTest, Item_test)
      }
      { // symmetry
          auto it = find_label("symmetry", readinput.input_lists);
@@ -1219,7 +1339,7 @@ index 4ace2f6..16ee7dd 100644
          TestParameters::input(param).gamma_only = true;
          it->second.reset_value(it->second, param);
 diff --git a/source/source_lcao/module_ri/exx_lri_interface.h b/source/source_lcao/module_ri/exx_lri_interface.h
-index 8b5bc61..9a55f16 100644
+index 8b5bc61cf..9a55f16b1 100644
 --- a/source/source_lcao/module_ri/exx_lri_interface.h
 +++ b/source/source_lcao/module_ri/exx_lri_interface.h
 @@ -99,6 +99,9 @@ public:
@@ -1241,7 +1361,7 @@ index 8b5bc61..9a55f16 100644
      module_dm::DensityMatrix<T, double>* dm_last_step;
  
 diff --git a/source/source_lcao/module_ri/exx_lri_interface.hpp b/source/source_lcao/module_ri/exx_lri_interface.hpp
-index b08514f..ca279b1 100644
+index b08514faa..ca279b198 100644
 --- a/source/source_lcao/module_ri/exx_lri_interface.hpp
 +++ b/source/source_lcao/module_ri/exx_lri_interface.hpp
 @@ -411,6 +411,10 @@ bool Exx_LRI_Interface<T, Tdata>::exx_after_converge(
@@ -1256,51 +1376,61 @@ index b08514f..ca279b1 100644
          if (this->two_level_step == this->hybrid_step_
              || (iter == 1 && this->two_level_step != 0) // density convergence of outer loop
 diff --git a/source/source_main/driver_run.cpp b/source/source_main/driver_run.cpp
-index bb637ce..0afeee5 100644
+index ccfa6e559..69fa638aa 100644
 --- a/source/source_main/driver_run.cpp
 +++ b/source/source_main/driver_run.cpp
-@@ -116,10 +116,11 @@ void Driver::driver_run()
-     {
-         initialize_ucell();
-         p_esolver->before_all_runners(ucell, PARAM.inp);
-+        bool ran_frame = true;
+@@ -114,7 +114,7 @@ void Driver::driver_run()
          if (cal == "scf" || cal == "relax" || cal == "cell-relax" || cal == "nscf")
          {
              Relax_Driver rl_driver;
 -            rl_driver.relax_driver(p_esolver, ucell, PARAM.inp, GlobalV::ofs_running);
-+            ran_frame = rl_driver.relax_driver(p_esolver, ucell, PARAM, GlobalV::ofs_running);
++            rl_driver.relax_driver(p_esolver, ucell, PARAM, GlobalV::ofs_running);
          }
          else if (cal == "get_s")
          {
-@@ -134,7 +135,7 @@ void Driver::driver_run()
-         {
-             ModuleBase::WARNING_QUIT("Driver::driver_run", "cannot recognize the 'calculation' command");
-         }
--        p_esolver->after_all_runners(ucell);
-+        if (ran_frame) { p_esolver->after_all_runners(ucell); }
-     }
- 
-     delete p_esolver;
 diff --git a/source/source_pw/module_pwdft/exx_helper.cpp b/source/source_pw/module_pwdft/exx_helper.cpp
-index 3f11748..cc8c2e8 100644
+index 79d102bec..45fd262ad 100644
 --- a/source/source_pw/module_pwdft/exx_helper.cpp
 +++ b/source/source_pw/module_pwdft/exx_helper.cpp
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,19 @@
  #include "source_estate/elecstate_pw.h" // use ElecStatePW
  #include "source_estate/module_charge/charge.h" // use Charge
  #include <chrono> // for timing
 +#include <stdexcept>
++
++void validate_electronic_step_exx(int functional_type, bool cal_exx)
++{
++    // Separate-loop SCAN0 starts as SCAN, before switching to hybrid meta-GGA.
++    // The upstream PW density path updates tau only for non-hybrid meta-GGA.
++    if (functional_type == 5 || (functional_type == 3 && cal_exx))
++    {
++        throw std::runtime_error(
++            "constant-potential PW hybrid meta-GGA is unsupported: "
++            "upstream kinetic-energy-density updates do not handle hybrid functionals");
++    }
++}
  
  template <typename T, typename Device>
  void Exx_Helper<T, Device>::init(const UnitCell& ucell, const Input_para& inp, const ModuleBase::matrix& wg, const General_Exx_Info& exx_info)
-@@ -127,7 +128,19 @@ double Exx_Helper<T, Device>::cal_exx_energy(void* psi_)
+@@ -90,7 +103,7 @@ bool Exx_Helper<T, Device>::iter_finish(void* p_elec, Charge* p_charge, void* ps
+             }
+             bool conv_ene = std::abs(dexx) < inp.exx_ene_thr;
+ 
+-            conv_esolver = this->exx_after_converge(iter, conv_ene);
++            conv_esolver = this->exx_after_converge(iter, conv_ene, inp);
+ 
+             if (!conv_esolver)
+             {
+@@ -130,9 +143,20 @@ double Exx_Helper<T, Device>::cal_exx_energy(void* psi_)
+ }
+ 
  template <typename T, typename Device>
- bool Exx_Helper<T, Device>::exx_after_converge(int &iter, bool ene_conv)
+-bool Exx_Helper<T, Device>::exx_after_converge(int iter, bool ene_conv)
++bool Exx_Helper<T, Device>::exx_after_converge(int iter, bool ene_conv, const Input_para& inp)
  {
 -    if (op_exx->first_iter)
 +    if (strict_electronic_step && op_exx->separate_loop)
 +    {
-+        const auto& inp = PARAM.inp;
 +        // A changed electron number must complete at least one EXX update.
 +        // Reaching the outer-loop budget is not a convergence criterion.
 +        const bool outer_converged = exx_iter > 0
@@ -1314,13 +1444,32 @@ index 3f11748..cc8c2e8 100644
      {
          op_exx->first_iter = false;
      }
-@@ -177,4 +190,3 @@ template class Exx_Helper<std::complex<double>, base_device::DEVICE_CPU>;
+@@ -140,15 +164,15 @@ bool Exx_Helper<T, Device>::exx_after_converge(int iter, bool ene_conv)
+     {
+         return true;
+     }
+-    else if (PARAM.inp.exx_thr_type == "energy" && ene_conv)
++    else if (inp.exx_thr_type == "energy" && ene_conv)
+     {
+         return true;
+     }
+-    else if (PARAM.inp.exx_thr_type == "density" && iter == 1)
++    else if (inp.exx_thr_type == "density" && iter == 1)
+     {
+         return true;
+     }
+-    else if (exx_iter >= PARAM.inp.exx_hybrid_step)
++    else if (exx_iter >= inp.exx_hybrid_step)
+     {
+         GlobalV::ofs_running << " !!EXX IS NOT CONVERGED!!" << std::endl;
+         std::cout << " !!EXX IS NOT CONVERGED!!" << std::endl;
+@@ -188,4 +212,3 @@ template class Exx_Helper<std::complex<double>, base_device::DEVICE_CPU>;
  template class Exx_Helper<std::complex<float>, base_device::DEVICE_GPU>;
  template class Exx_Helper<std::complex<double>, base_device::DEVICE_GPU>;
  #endif
 -
 diff --git a/source/source_pw/module_pwdft/exx_helper.h b/source/source_pw/module_pwdft/exx_helper.h
-index 2adb945..a400c1e 100644
+index 31b25eeea..8f7fb3d8e 100644
 --- a/source/source_pw/module_pwdft/exx_helper.h
 +++ b/source/source_pw/module_pwdft/exx_helper.h
 @@ -20,6 +20,12 @@ struct Exx_Helper : public Exx_HelperBase
@@ -1336,7 +1485,7 @@ index 2adb945..a400c1e 100644
      void init(const UnitCell& ucell, const Input_para& inp, const ModuleBase::matrix& wg, const General_Exx_Info& exx_info) override;
  
      void before_scf(void* p_hamilt, void* psi, const Input_para& inp, const General_Exx_Info& exx_info) override;
-@@ -36,8 +42,13 @@ struct Exx_Helper : public Exx_HelperBase
+@@ -36,11 +42,16 @@ struct Exx_Helper : public Exx_HelperBase
      void set_op() override
      {
          op_exx->first_iter = first_iter;
@@ -1350,7 +1499,11 @@ index 2adb945..a400c1e 100644
 +        if (!strict_electronic_step) { op_exx->set_wg(wg); }
      }
  
-     bool exx_after_converge(int &iter, bool ene_conv) override;
+-    bool exx_after_converge(int iter, bool ene_conv) override;
++    bool exx_after_converge(int iter, bool ene_conv, const Input_para& inp) override;
+ 
+     double cal_exx_energy(void* psi_) override;
+ 
 @@ -53,6 +64,7 @@ struct Exx_Helper : public Exx_HelperBase
      psi::Psi<T, Device> *psi = nullptr;
      const ModuleBase::matrix *wg = nullptr;
@@ -1360,10 +1513,18 @@ index 2adb945..a400c1e 100644
  };
  #endif // EXX_HELPER_H
 diff --git a/source/source_pw/module_pwdft/exx_helper_base.h b/source/source_pw/module_pwdft/exx_helper_base.h
-index 7ebab44..02e403f 100644
+index 12bd8d7ae..11f1b98b5 100644
 --- a/source/source_pw/module_pwdft/exx_helper_base.h
 +++ b/source/source_pw/module_pwdft/exx_helper_base.h
-@@ -14,6 +14,9 @@ class Exx_HelperBase
+@@ -8,12 +8,17 @@ class UnitCell;
+ struct Input_para;
+ struct General_Exx_Info;
+ 
++void validate_electronic_step_exx(int functional_type, bool cal_exx);
++
+ class Exx_HelperBase
+ {
+   public:
      Exx_HelperBase() = default;
      virtual ~Exx_HelperBase() = default;
  
@@ -1373,64 +1534,63 @@ index 7ebab44..02e403f 100644
      virtual void init(const UnitCell& ucell, const Input_para& inp, const ModuleBase::matrix& wg, const General_Exx_Info& exx_info) = 0;
  
      virtual void before_scf(void* p_hamilt, void* psi, const Input_para& inp, const General_Exx_Info& exx_info) = 0;
+@@ -35,7 +40,7 @@ class Exx_HelperBase
+     ///       value (false = not converged, rerun SCF) and the caller
+     ///       (ESolver_KS_PW) sets ESolver_KS::scf_rerun_ to trigger the
+     ///       restart at iter=1 in ESolver_KS::runner.
+-    virtual bool exx_after_converge(int iter, bool ene_conv) = 0;
++    virtual bool exx_after_converge(int iter, bool ene_conv, const Input_para& inp) = 0;
+ 
+     virtual double cal_exx_energy(void* psi) = 0;
+ 
 diff --git a/source/source_relax/CMakeLists.txt b/source/source_relax/CMakeLists.txt
-index 0d16bbe..0b53275 100644
+index 8dc901592..0f0f38f75 100644
 --- a/source/source_relax/CMakeLists.txt
 +++ b/source/source_relax/CMakeLists.txt
-@@ -7,6 +7,7 @@ add_library(
-     socket_frame.cpp
-     socket_utils.cpp
-     socket_handlers.cpp
-+    socket_constant_potential.cpp
-     socket_driver.cpp
-     cg_base.cpp
-     relax_driver.cpp
+@@ -6,6 +6,7 @@ add_library(
+   socket_frame.cpp
+   socket_utils.cpp
+   socket_handlers.cpp
++  socket_constant_potential.cpp
+   socket_driver.cpp
+   cg_base.cpp
+   relax_driver.cpp
 diff --git a/source/source_relax/relax_driver.cpp b/source/source_relax/relax_driver.cpp
-index 7497fc8..59f9553 100644
+index cf56ffd2d..096a9dd21 100644
 --- a/source/source_relax/relax_driver.cpp
 +++ b/source/source_relax/relax_driver.cpp
-@@ -10,12 +10,13 @@
- #include "source_base/module_out/read_exit_file.h"
+@@ -12,10 +12,12 @@
  #include "source_io/module_parameter/parameter.h"
  
--void Relax_Driver::relax_driver(
-+bool Relax_Driver::relax_driver(
-         ModuleESolver::ESolver* p_esolver,
-         UnitCell& ucell,
--        const Input_para& inp,
-+        Parameter& parameters,
-         std::ofstream& ofs_running)
+ void Relax_Driver::relax_driver(ModuleESolver::ESolver* p_esolver,
+-                                UnitCell& ucell,
+-                                const Input_para& inp,
+-                                std::ofstream& ofs_running)
++                               UnitCell& ucell,
++                               Parameter& parameters,
++                               std::ofstream& ofs_running)
  {
 +    const Input_para& inp = parameters.inp;
++    const System_para& system = parameters.globalv;
      ModuleBase::TITLE("Relax_Driver", "relax_driver");
      ModuleBase::timer::start("Relax_Driver", "relax_driver");
  
-@@ -28,9 +29,9 @@ void Relax_Driver::relax_driver(
+@@ -28,8 +30,8 @@ void Relax_Driver::relax_driver(ModuleESolver::ESolver* p_esolver,
      if (inp.socket_driver)
      {
          Socket_Driver socket_driver;
 -        socket_driver.socket_driver(p_esolver, ucell, inp, ofs_running);
-+        const bool ran_frame = socket_driver.socket_driver(p_esolver, ucell, parameters, ofs_running);
+-        p_esolver->after_all_runners(ucell);
++        const bool ran_frame = socket_driver.socket_driver(p_esolver, ucell, parameters, inp, system, ofs_running);
++        if (ran_frame) { p_esolver->after_all_runners(ucell); }
          ModuleBase::timer::end("Relax_Driver", "relax_driver");
--        return;
-+        return ran_frame;
+         return;
      }
- 
-     this->init_relax(ucell.nat, inp);
-@@ -83,7 +84,7 @@ void Relax_Driver::relax_driver(
-     this->final_out(steps[0], ucell, inp, etot, stress, force, geometry_evaluated, ofs_running);
- 
-     ModuleBase::timer::end("Relax_Driver", "relax_driver");
--    return;
-+    return true;
- }
- 
- void Relax_Driver::init_relax(const int nat, const Input_para& inp)
 diff --git a/source/source_relax/relax_driver.h b/source/source_relax/relax_driver.h
-index be4b99c..e61a03a 100644
+index 34540f00b..2f02ac114 100644
 --- a/source/source_relax/relax_driver.h
 +++ b/source/source_relax/relax_driver.h
-@@ -17,6 +17,8 @@
+@@ -18,6 +18,8 @@
   * This class manages the main relaxation loop, including energy solving,
   * force/stress calculation, and structure optimization steps.
   */
@@ -1439,7 +1599,7 @@ index be4b99c..e61a03a 100644
  class Relax_Driver
  {
  
-@@ -33,12 +35,12 @@ class Relax_Driver
+@@ -34,12 +36,12 @@ class Relax_Driver
       *
       * @param p_esolver Pointer to the energy solver.
       * @param ucell Reference to the unit cell to be relaxed.
@@ -1447,24 +1607,24 @@ index be4b99c..e61a03a 100644
 +     * @param parameters Runtime input and electronic parameters.
       * @param ofs_running Output stream for running log.
       */
--    void relax_driver(ModuleESolver::ESolver* p_esolver,
-+    bool relax_driver(ModuleESolver::ESolver* p_esolver,
-             UnitCell& ucell,
--            const Input_para& inp,
-+            Parameter& parameters,
-             std::ofstream& ofs_running);
+     void relax_driver(ModuleESolver::ESolver* p_esolver,
+                       UnitCell& ucell,
+-                      const Input_para& inp,
++                      Parameter& parameters,
+                       std::ofstream& ofs_running);
  
    private:
 diff --git a/source/source_relax/socket_constant_potential.cpp b/source/source_relax/socket_constant_potential.cpp
 new file mode 100644
-index 0000000..22c6c1c
+index 000000000..cecff4c7d
 --- /dev/null
 +++ b/source/source_relax/socket_constant_potential.cpp
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,198 @@
 +#include "socket_constant_potential.h"
 +#include "source_base/constants.h"
 +#include "source_esolver/esolver.h"
-+#include "source_io/module_parameter/parameter.h"
++#include "source_io/module_parameter/input_parameter.h"
++#include "source_io/module_parameter/system_parameter.h"
 +
 +#include <cmath>
 +#include <iomanip>
@@ -1499,6 +1659,70 @@ index 0000000..22c6c1c
 +
 +namespace SocketCP
 +{
++void run_electronic_step(ModuleESolver::ESolver& solver, UnitCell& cell,
++                         Parameter& parameters, const Input_para& inp, const System_para& system,
++                         const elecstate::ElectronicControl& control, int functional_type, int istep)
++{
++    if (inp.assume_isolated == "makov-payne")
++    {
++        throw std::runtime_error(
++            "constant-potential electron control is incompatible with the energy-only Makov-Payne correction");
++    }
++    if (inp.esolver_type != "ksdft" || (inp.basis_type != "pw" && inp.basis_type != "lcao")
++        || inp.device != "cpu" || inp.precision != "double" || system.use_uspp
++        || inp.sc_mag_switch || inp.deepks_scf || inp.rpa || inp.rdmft || inp.dft_plus_dmft)
++    {
++        throw std::runtime_error(
++            "constant-potential control requires CPU double-precision PW/LCAO KSDFT with "
++            "norm-conserving pseudopotentials; specialized solver corrections are not supported");
++    }
++    if (functional_type < 1 || functional_type > 5)
++    {
++        throw std::runtime_error(
++            "constant-potential control requires a supported KS exchange-correlation functional");
++    }
++    if (inp.dft_plus_u != 0 && inp.dft_plus_u != 1)
++    {
++        throw std::runtime_error(
++            "constant-potential forces require dft_plus_u=1; "
++            "the legacy dft_plus_u=2 force implementation is unavailable");
++    }
++    if (inp.dft_plus_u && (inp.init_occ_mat < 0 || inp.init_occ_mat > 1
++                          || inp.yukawa_potential || system.uramping > 0.0))
++    {
++        throw std::runtime_error(
++            "constant-potential DFT+U requires fixed Hubbard U and self-consistent occupations "
++            "(init_occ_mat=0/1, yukawa_potential=false, uramping disabled)");
++    }
++    if (inp.init_chg == "dm_no_renormalize")
++    { throw std::runtime_error("electron-number control requires charge-density renormalization"); }
++    if (inp.nspin != 1 && inp.nspin != 2)
++    { throw std::runtime_error("constant-potential control supports only nspin=1 or 2"); }
++    if (inp.ocp || inp.nbands <= 0 || !std::isfinite(control.nelect) || control.nelect <= 0.0)
++    { throw std::runtime_error("invalid total electron number, band capacity, or fixed occupation array"); }
++    const bool two_fermi = system.two_fermi;
++    if (two_fermi && inp.nspin != 2)
++    { throw std::runtime_error("two_fermi electron control requires nspin=2"); }
++    const double up = 0.5 * (control.nelect + inp.nupdown);
++    const double down = 0.5 * (control.nelect - inp.nupdown);
++    if ((two_fermi && (!std::isfinite(inp.nupdown) || up <= 0.0 || down <= 0.0
++                      || up > inp.nbands || down > inp.nbands))
++        || control.nelect > 2.0 * inp.nbands)
++    {
++        throw std::runtime_error(
++            "electron number exceeds band capacity or gives invalid spin populations; increase nbands");
++    }
++    if (inp.smearing_method == "fixed"
++        && (std::abs(control.nelect - std::round(control.nelect)) > 1.0e-8
++            || (two_fermi && (std::abs(up-std::round(up)) > 1.0e-8 || std::abs(down-std::round(down)) > 1.0e-8))))
++    { throw std::runtime_error("fractional electron populations require a smearing occupation method"); }
++    if (!solver.apply_electronic_control(parameters, control))
++    {
++        throw std::runtime_error("selected ESolver does not support constant-potential electron control");
++    }
++    solver.runner(cell, istep);
++}
++
 +Configuration parse_init(const std::string& parameters)
 +{
 +    const std::string keys[] = {"NELECT", "neutral_electrons",
@@ -1543,7 +1767,7 @@ index 0000000..22c6c1c
 +    return config;
 +}
 +
-+ModuleESolver::ElectronicControl make_control(const Configuration& config, double nelect, int flags)
++elecstate::ElectronicControl make_control(const Configuration& config, double nelect, int flags)
 +{
 +    if (!config.enabled) { throw std::runtime_error("CHGDATA requires constant-potential INIT metadata"); }
 +    if (!std::isfinite(nelect) || nelect <= 0.0)
@@ -1551,7 +1775,7 @@ index 0000000..22c6c1c
 +    if (flags != 0 && flags != 2)
 +    { throw std::runtime_error("CHGDATA flags must be 0 or 2; bit 0 is reserved"); }
 +    if (flags & 2) { throw std::runtime_error("ABACUS Ne-electrode CHGDATA is not supported"); }
-+    ModuleESolver::ElectronicControl control;
++    elecstate::ElectronicControl control;
 +    control.nelect = nelect;
 +    return control;
 +}
@@ -1560,7 +1784,7 @@ index 0000000..22c6c1c
 +                               const UnitCell& cell, const Parameter& parameters)
 +{
 +    if (!config.enabled) { throw std::runtime_error("electronic observables require constant-potential INIT"); }
-+    ModuleESolver::ElectronicObservables physical;
++    elecstate::ElectronicObservables physical;
 +    if (!solver.electronic_observables(cell, parameters, config.window, physical))
 +    { throw std::runtime_error("ESolver cannot provide constant-potential electronic observables"); }
 +    Observables result;
@@ -1596,18 +1820,20 @@ index 0000000..22c6c1c
 +}
 diff --git a/source/source_relax/socket_constant_potential.h b/source/source_relax/socket_constant_potential.h
 new file mode 100644
-index 0000000..5470259
+index 000000000..7ffc1d948
 --- /dev/null
 +++ b/source/source_relax/socket_constant_potential.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,44 @@
 +#ifndef ABACUS_SOCKET_CONSTANT_POTENTIAL_H
 +#define ABACUS_SOCKET_CONSTANT_POTENTIAL_H
 +
-+#include "source_esolver/electronic_control.h"
++#include "source_estate/electronic_control.h"
 +#include <string>
 +
 +class Parameter;
 +class UnitCell;
++struct Input_para;
++struct System_para;
 +namespace ModuleESolver { class ESolver; }
 +
 +namespace SocketCP
@@ -1615,7 +1841,7 @@ index 0000000..5470259
 +struct Configuration
 +{
 +    bool enabled = false;
-+    ModuleESolver::PotentialWindow window;
++    elecstate::PotentialWindow window;
 +};
 +
 +struct Observables
@@ -1627,8 +1853,13 @@ index 0000000..5470259
 +    double workfunction_eV = 0.0;
 +};
 +
++// Apply one external electron-number request and evaluate the current geometry.
++void run_electronic_step(ModuleESolver::ESolver& solver, UnitCell& cell,
++                         Parameter& parameters, const Input_para& input, const System_para& system,
++                         const elecstate::ElectronicControl& control, int functional_type, int istep);
++
 +Configuration parse_init(const std::string& parameters);
-+ModuleESolver::ElectronicControl make_control(const Configuration& config, double nelect, int flags);
++elecstate::ElectronicControl make_control(const Configuration& config, double nelect, int flags);
 +// Called on every rank while evaluating POSDATA; the solver may use collectives.
 +Observables collect_observables(const Configuration& config, const ModuleESolver::ESolver& solver,
 +                               const UnitCell& cell, const Parameter& parameters);
@@ -1638,18 +1869,10 @@ index 0000000..5470259
 +
 +#endif
 diff --git a/source/source_relax/socket_driver.cpp b/source/source_relax/socket_driver.cpp
-index d63c834..356c1a2 100644
+index 03d19cb27..433c2688e 100644
 --- a/source/source_relax/socket_driver.cpp
 +++ b/source/source_relax/socket_driver.cpp
-@@ -6,6 +6,7 @@
- #include "source_cell/unitcell.h"
- #include "source_esolver/esolver.h"
- #include "source_io/module_parameter/input_parameter.h"
-+#include "source_io/module_parameter/parameter.h"
- 
- #include <exception>
- #include <fstream>
-@@ -51,10 +52,11 @@ void log_peer_closed(std::ofstream& ofs_running)
+@@ -51,10 +51,12 @@ void log_peer_closed(std::ofstream& ofs_running)
  }
  } // namespace
  
@@ -1661,11 +1884,12 @@ index d63c834..356c1a2 100644
 +                              UnitCell& ucell,
 +                              const Input_para& inp,
 +                              Parameter* parameters,
++                              const System_para* system,
 +                              std::ofstream& ofs_running)
  {
      ModuleBase::TITLE("Socket_Driver", "socket_driver");
      ModuleBase::timer::start("Socket_Driver", "socket_driver");
-@@ -64,15 +66,16 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
+@@ -64,22 +66,24 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
          ModuleBase::WARNING_QUIT("ABACUS socket", "socket driver requires a valid ESolver.");
      }
      IpiSocket socket;
@@ -1680,19 +1904,19 @@ index d63c834..356c1a2 100644
          context.ucell = &ucell;
          context.inp = &inp;
 +        context.parameters = parameters;
++        context.system = system;
          context.state = DriverState::NeedInit;
          context.nat_return = ucell.nat;
          context.reference_cell = ipi_cell_bohr_from_unitcell(ucell);
-@@ -80,7 +83,7 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
+ 
          while (true)
          {
-             const std::string header
--                = SocketHandlers::read_header_bcast(socket, context.state);
-+                = SocketHandlers::read_header_bcast(socket, context);
+-            const std::string header = SocketHandlers::read_header_bcast(socket, context.state);
++            const std::string header = SocketHandlers::read_header_bcast(socket, context);
              if (header.empty())
              {
                  log_peer_closed(ofs_running);
-@@ -98,13 +101,17 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
+@@ -97,13 +101,17 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
              {
                  SocketHandlers::handle_posdata(socket, context, ofs_running);
              }
@@ -1712,7 +1936,7 @@ index d63c834..356c1a2 100644
                  break;
              }
              else
-@@ -125,4 +132,17 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
+@@ -123,4 +131,18 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
      }
  
      ModuleBase::timer::end("Socket_Driver", "socket_driver");
@@ -1722,43 +1946,55 @@ index d63c834..356c1a2 100644
 +bool Socket_Driver::socket_driver(ModuleESolver::ESolver* solver, UnitCell& cell,
 +                                 const Input_para& input, std::ofstream& log)
 +{
-+    return run_socket_driver(solver, cell, input, nullptr, log);
++    return run_socket_driver(solver, cell, input, nullptr, nullptr, log);
 +}
 +
 +bool Socket_Driver::socket_driver(ModuleESolver::ESolver* solver, UnitCell& cell,
-+                                 Parameter& parameters, std::ofstream& log)
++                                 Parameter& parameters, const Input_para& input,
++                                 const System_para& system, std::ofstream& log)
 +{
-+    return run_socket_driver(solver, cell, parameters.inp, &parameters, log);
++    return run_socket_driver(solver, cell, input, &parameters, &system, log);
  }
 diff --git a/source/source_relax/socket_driver.h b/source/source_relax/socket_driver.h
-index 86c180f..0ac34c6 100644
+index 86c180fc4..8a37dc440 100644
 --- a/source/source_relax/socket_driver.h
 +++ b/source/source_relax/socket_driver.h
-@@ -4,6 +4,7 @@
+@@ -4,7 +4,9 @@
  #include <iosfwd>
  
  class UnitCell;
 +class Parameter;
  struct Input_para;
++struct System_para;
  
  namespace ModuleESolver
-@@ -17,7 +18,10 @@ class Socket_Driver
+ {
+@@ -17,7 +19,11 @@ class Socket_Driver
      Socket_Driver() = default;
      ~Socket_Driver() = default;
  
 -    void socket_driver(ModuleESolver::ESolver* p_esolver,
 +    bool socket_driver(ModuleESolver::ESolver* solver, UnitCell& cell,
-+                       Parameter& parameters, std::ofstream& log);
++                       Parameter& parameters, const Input_para& input,
++                       const System_para& system, std::ofstream& log);
 +
 +    bool socket_driver(ModuleESolver::ESolver* p_esolver,
                         UnitCell& ucell,
                         const Input_para& inp,
                         std::ofstream& ofs_running);
 diff --git a/source/source_relax/socket_handlers.cpp b/source/source_relax/socket_handlers.cpp
-index 94fa504..e08e318 100644
+index 71ceb4c4e..2dc3ceb89 100644
 --- a/source/source_relax/socket_handlers.cpp
 +++ b/source/source_relax/socket_handlers.cpp
-@@ -12,6 +12,7 @@
+@@ -3,6 +3,7 @@
+ #include "source_base/global_function.h"
+ #include "source_cell/unitcell.h"
+ #include "source_esolver/esolver.h"
++#include "source_hamilt/module_xc/xc_functional.h"
+ #include "source_io/module_parameter/input_parameter.h"
+ #include "source_relax/socket_frame.h"
+ #ifdef __JSON
+@@ -12,6 +13,7 @@
  #include <algorithm>
  #include <cmath>
  #include <cstdint>
@@ -1766,15 +2002,15 @@ index 94fa504..e08e318 100644
  #include <limits>
  #include <stdexcept>
  #include <string>
-@@ -32,6 +33,7 @@ using SocketUtils::all_ranks_converged;
- using SocketUtils::bcast_double_vector;
- using SocketUtils::bcast_header;
- using SocketUtils::bcast_int32;
+@@ -36,6 +38,7 @@ using SocketUtils::kMaxInitBytes;
+ using SocketUtils::kRyToHartree;
+ using SocketUtils::kStressAbsoluteTolerance;
+ using SocketUtils::kStressRelativeTolerance;
 +using SocketUtils::bcast_string;
- using SocketUtils::fail_during_collective_stage;
- using SocketUtils::flatten_forces_hartree_per_bohr;
- using SocketUtils::ipi_cell_bohr_from_unitcell;
-@@ -46,7 +48,7 @@ using SocketUtils::throw_if_any_rank_failed;
+ using SocketUtils::matrix9_from_stress;
+ using SocketUtils::max_abs_delta;
+ using SocketUtils::max_wrapped_direct_delta_from_unitcell;
+@@ -46,7 +49,7 @@ using SocketUtils::throw_if_any_rank_failed;
  using SocketUtils::unchanged_cell_tolerance;
  using SocketUtils::vector_from_matrix9;
  
@@ -1783,7 +2019,7 @@ index 94fa504..e08e318 100644
  {
      std::string header;
      int io_failed = 0;
-@@ -59,7 +61,7 @@ std::string read_header_bcast(IpiSocket& socket, const DriverState state)
+@@ -59,7 +62,7 @@ std::string read_header_bcast(IpiSocket& socket, const DriverState state)
          }
          catch (const IpiSocketClosed&)
          {
@@ -1792,7 +2028,7 @@ index 94fa504..e08e318 100644
              {
                  io_failed = 1;
                  io_message = "i-PI peer closed while a computed frame was pending";
-@@ -156,6 +158,25 @@ void handle_init(IpiSocket& socket,
+@@ -154,6 +157,25 @@ void handle_init(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_r
      {
          ofs_running << " ABACUS socket INIT params bytes " << nbytes << std::endl;
      }
@@ -1802,7 +2038,7 @@ index 94fa504..e08e318 100644
 +    try
 +    {
 +        context.cp = SocketCP::parse_init(params);
-+        if (context.cp.enabled && (context.parameters == nullptr || !context.inp->cal_force
++        if (context.cp.enabled && (context.parameters == nullptr || context.system == nullptr || !context.inp->cal_force
 +            || context.inp->cal_stress || (context.inp->symmetry != "0" && context.inp->symmetry != "-1")))
 +        {
 +            throw std::runtime_error("constant-potential socket requires runtime parameters, "
@@ -1818,7 +2054,7 @@ index 94fa504..e08e318 100644
      context.state = DriverState::Ready;
      if (is_root())
      {
-@@ -163,6 +184,52 @@ void handle_init(IpiSocket& socket,
+@@ -161,6 +183,52 @@ void handle_init(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_r
      }
  }
  
@@ -1871,7 +2107,7 @@ index 94fa504..e08e318 100644
  namespace
  {
  struct PosdataPayload
-@@ -179,18 +246,23 @@ struct PosdataPayload
+@@ -177,18 +245,23 @@ struct PosdataPayload
  // passes through the single quit_if_root_failed collective sequence below;
  // a root-only early quit outside would deadlock if any collective were
  // added ahead of it.
@@ -1897,7 +2133,7 @@ index 94fa504..e08e318 100644
          else
          {
              try
-@@ -214,7 +286,7 @@ PosdataPayload read_posdata(IpiSocket& socket, const UnitCell& ucell, const Driv
+@@ -212,7 +285,7 @@ PosdataPayload read_posdata(IpiSocket& socket, const UnitCell& ucell, const Driv
                  std::size_t coordinate_count = 0;
                  if (io_failed == 0
                      && !SocketFrame::checked_position_count(payload.nat_socket,
@@ -1906,18 +2142,15 @@ index 94fa504..e08e318 100644
                                                              coordinate_count,
                                                              io_message))
                  {
-@@ -263,21 +335,28 @@ void bcast_posdata(PosdataPayload& payload)
+@@ -259,18 +332,29 @@ void bcast_posdata(PosdataPayload& payload)
      bcast_double_vector(payload.positions);
  }
  
--void check_posdata_geometry(const DriverContext& context,
--                            const PosdataPayload& payload,
--                            DriverContext& mutable_context)
+-void check_posdata_geometry(const DriverContext& context, const PosdataPayload& payload, DriverContext& mutable_context)
 +void check_posdata_geometry(DriverContext& context, const PosdataPayload& payload)
  {
--    const double max_cell_delta_bohr = max_abs_delta(
--        std::vector<double>(payload.cell.begin(), payload.cell.end()),
--        context.reference_cell);
+-    const double max_cell_delta_bohr
+-        = max_abs_delta(std::vector<double>(payload.cell.begin(), payload.cell.end()), context.reference_cell);
 -    if (max_cell_delta_bohr > unchanged_cell_tolerance(payload.cell))
 +    const std::vector<double> wire_cell(payload.cell.begin(), payload.cell.end());
 +    const auto& expected_cell = context.cp.enabled && !context.cp_wire_cell.empty()
@@ -1932,19 +2165,21 @@ index 94fa504..e08e318 100644
 +    }
 +    if (max_abs_delta(wire_cell, expected_cell) > cell_tolerance)
      {
-         ModuleBase::WARNING_QUIT("ABACUS socket",
-                                  "variable-cell socket updates are not supported yet.");
+         ModuleBase::WARNING_QUIT("ABACUS socket", "variable-cell socket updates are not supported yet.");
      }
 -    if (!mutable_context.checked_initial_positions)
 +    if (context.cp.enabled && context.cp_wire_cell.empty()) { context.cp_wire_cell = wire_cell; }
 +    if (!context.checked_initial_positions)
      {
 -        mutable_context.checked_initial_positions = true;
+-        if (max_wrapped_direct_delta_from_unitcell(*context.ucell, payload.positions) > 1.0e-5 && is_root())
 +        context.checked_initial_positions = true;
-         if (max_wrapped_direct_delta_from_unitcell(*context.ucell, payload.positions) > 1.0e-5
-             && is_root())
++        if (max_wrapped_direct_delta_from_unitcell(*context.ucell, payload.positions) > 1.0e-5
++            && is_root())
          {
-@@ -290,14 +369,11 @@ void check_posdata_geometry(const DriverContext& context,
+             ModuleBase::WARNING("ABACUS socket",
+                                 "first POSDATA positions are not PBC-equivalent to STRU atom order; "
+@@ -280,14 +364,11 @@ void check_posdata_geometry(const DriverContext& context, const PosdataPayload&
      }
  }
  
@@ -1961,7 +2196,7 @@ index 94fa504..e08e318 100644
      }
      catch (const std::exception& exc)
      {
-@@ -309,7 +385,15 @@ void run_esolver_for_positions(UnitCell& ucell,
+@@ -299,7 +380,18 @@ void run_esolver_for_positions(UnitCell& ucell,
      }
      try
      {
@@ -1969,18 +2204,21 @@ index 94fa504..e08e318 100644
 +        if (context.cp.enabled)
 +        {
 +            context.charge_pending = false;
-+            if (!context.esolver->apply_electronic_control(*context.parameters, context.pending_control))
-+            {
-+                throw std::runtime_error("selected ESolver does not support constant-potential electron control");
-+            }
++            const int functional_type = XC_Functional::get_func_type();
++            SocketCP::run_electronic_step(*context.esolver, *context.ucell, *context.parameters,
++                                          *context.inp, *context.system, context.pending_control,
++                                          functional_type, context.istep);
 +        }
-+        context.esolver->runner(*context.ucell, context.istep);
++        else
++        {
++            context.esolver->runner(*context.ucell, context.istep);
++        }
      }
      catch (const std::exception& exc)
      {
-@@ -443,17 +527,21 @@ void handle_posdata(IpiSocket& socket,
-                     DriverContext& context,
-                     std::ofstream& ofs_running)
+@@ -421,17 +513,21 @@ void compute_stress(UnitCell& ucell, ModuleESolver::ESolver* esolver, ComputedFr
+ 
+ void handle_posdata(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_running)
  {
 -    PosdataPayload payload = read_posdata(socket, *context.ucell, context.state);
 +    PosdataPayload payload = read_posdata(socket, context);
@@ -2002,8 +2240,8 @@ index 94fa504..e08e318 100644
 +    }
      if (!computed.scf_converged && is_root())
      {
-         ModuleBase::WARNING(
-@@ -469,13 +557,30 @@ void handle_posdata(IpiSocket& socket,
+         ModuleBase::WARNING("ABACUS socket",
+@@ -446,13 +542,30 @@ void handle_posdata(IpiSocket& socket, DriverContext& context, std::ofstream& of
      {
          compute_stress(*context.ucell, context.esolver, computed);
      }
@@ -2035,7 +2273,7 @@ index 94fa504..e08e318 100644
  {
      int io_failed = 0;
      std::string io_message;
-@@ -503,6 +608,7 @@ void handle_getforce(IpiSocket& socket, DriverContext& context)
+@@ -480,6 +593,7 @@ void handle_getforce(IpiSocket& socket, DriverContext& context)
              }
              socket.write_int32(static_cast<std::int32_t>(extra.size()));
              socket.write_string(extra);
@@ -2043,7 +2281,7 @@ index 94fa504..e08e318 100644
          }
          catch (const std::exception& exc)
          {
-@@ -515,8 +621,11 @@ void handle_getforce(IpiSocket& socket, DriverContext& context)
+@@ -492,8 +606,11 @@ void handle_getforce(IpiSocket& socket, DriverContext& context)
      context.state = DriverState::Ready;
  }
  
@@ -2057,22 +2295,24 @@ index 94fa504..e08e318 100644
      {
          ofs_running << " ABACUS socket driver received i-PI EXIT" << std::endl;
 diff --git a/source/source_relax/socket_handlers.h b/source/source_relax/socket_handlers.h
-index 4681491..127dada 100644
+index f73224503..f69ab1149 100644
 --- a/source/source_relax/socket_handlers.h
 +++ b/source/source_relax/socket_handlers.h
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
  #include <vector>
  
  class UnitCell;
 +class Parameter;
++struct System_para;
  
  namespace ModuleESolver
  {
-@@ -23,18 +24,23 @@ struct DriverContext
+@@ -23,28 +25,36 @@ struct DriverContext
      ModuleESolver::ESolver* esolver = nullptr;
      UnitCell* ucell = nullptr;
      const Input_para* inp = nullptr;
 +    Parameter* parameters = nullptr;
++    const System_para* system = nullptr;
      SocketUtils::DriverState state = SocketUtils::DriverState::NeedInit;
      int istep = 0;
      int nat_return = 0;
@@ -2080,7 +2320,7 @@ index 4681491..127dada 100644
      std::vector<double> reference_cell;
      bool checked_initial_positions = false;
 +    SocketCP::Configuration cp;
-+    ModuleESolver::ElectronicControl pending_control;
++    elecstate::ElectronicControl pending_control;
 +    bool charge_pending = false;
 +    std::vector<double> cp_wire_cell;
  };
@@ -2093,15 +2333,11 @@ index 4681491..127dada 100644
  
  void handle_status(IpiSocket& socket, const SocketUtils::DriverState state);
  
-@@ -42,13 +48,15 @@ void handle_init(IpiSocket& socket,
-                  DriverContext& context,
-                  std::ofstream& ofs_running);
+ void handle_init(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_running);
  
 +void handle_chgdata(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_running);
 +
- void handle_posdata(IpiSocket& socket,
-                     DriverContext& context,
-                     std::ofstream& ofs_running);
+ void handle_posdata(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_running);
  
 -void handle_getforce(IpiSocket& socket, DriverContext& context);
 +void handle_getforce(IpiSocket& socket, DriverContext& context, std::ofstream& ofs_running);
@@ -2112,14 +2348,15 @@ index 4681491..127dada 100644
  
  #endif
 diff --git a/source/source_relax/socket_utils.cpp b/source/source_relax/socket_utils.cpp
-index ccdfa38..021208f 100644
+index 8f41d0054..605941a13 100644
 --- a/source/source_relax/socket_utils.cpp
 +++ b/source/source_relax/socket_utils.cpp
-@@ -83,7 +83,13 @@ std::string properties_extra(const ComputedFrame& frame)
+@@ -77,7 +77,14 @@ std::string properties_extra(const ComputedFrame& frame)
+     {
          extra << ",\"stress\"";
      }
-     extra << "],\"scf_converged\":"
--          << (frame.scf_converged ? "true" : "false") << "}";
+-    extra << "],\"scf_converged\":" << (frame.scf_converged ? "true" : "false") << "}";
++    extra << "],\"scf_converged\":"
 +          << (frame.scf_converged ? "true" : "false");
 +    if (frame.electronic_present)
 +    {
@@ -2130,7 +2367,7 @@ index ccdfa38..021208f 100644
      return extra.str();
  }
  
-@@ -288,6 +294,9 @@ void set_positions_from_ipi_bohr(UnitCell& ucell, const std::vector<double>& pos
+@@ -288,6 +295,9 @@ void set_positions_from_ipi_bohr(UnitCell& ucell, const std::vector<double>& pos
              atom->dis[ia].x = dx - atom->taud[ia].x;
              atom->dis[ia].y = dy - atom->taud[ia].y;
              atom->dis[ia].z = dz - atom->taud[ia].z;
@@ -2141,18 +2378,18 @@ index ccdfa38..021208f 100644
              atom->taud[ia].y = dy;
              atom->taud[ia].z = dz;
 diff --git a/source/source_relax/socket_utils.h b/source/source_relax/socket_utils.h
-index ccac976..e559c95 100644
+index 4314d1653..d69db6cc5 100644
 --- a/source/source_relax/socket_utils.h
 +++ b/source/source_relax/socket_utils.h
-@@ -2,6 +2,7 @@
+@@ -1,6 +1,7 @@
+ #ifndef ABACUS_SOURCE_RELAX_SOCKET_UTILS_H
  #define ABACUS_SOURCE_RELAX_SOCKET_UTILS_H
  
- #include "source_relax/socket_frame.h"
 +#include "source_relax/socket_constant_potential.h"
  #include "source_base/matrix.h"
+ #include "source_relax/socket_frame.h"
  
- #include <cstdint>
-@@ -36,6 +37,8 @@ struct ComputedFrame
+@@ -35,6 +36,8 @@ struct ComputedFrame
      bool forces_present = false;
      bool stress_present = false;
      bool scf_converged = true;
@@ -2162,32 +2399,278 @@ index ccac976..e559c95 100644
      std::vector<double> forces_hartree_per_bohr;
      SocketFrame::Matrix9 virial_wire_hartree = {{0.0}};
 diff --git a/source/source_relax/unittests/CMakeLists.txt b/source/source_relax/unittests/CMakeLists.txt
-index d08c591..13e8140 100644
+index 804c81989..a9b822357 100644
 --- a/source/source_relax/unittests/CMakeLists.txt
 +++ b/source/source_relax/unittests/CMakeLists.txt
-@@ -14,6 +14,11 @@ AddTest(
-   SOURCES test_socket_frame.cpp ../socket_frame.cpp ../socket_frame_utils.cpp
- )
+@@ -10,6 +10,9 @@ addtest(TARGET MODULE_RELAX_socket_ipi_test SOURCES test_socket_ipi.cpp
+ addtest(TARGET MODULE_RELAX_socket_frame_test SOURCES test_socket_frame.cpp
+         ../socket_frame.cpp ../socket_frame_utils.cpp)
  
-+AddTest(
-+  TARGET MODULE_RELAX_socket_constant_potential_test
-+  SOURCES test_socket_constant_potential.cpp ../socket_constant_potential.cpp
-+)
++addtest(TARGET MODULE_RELAX_socket_constant_potential_test
++        SOURCES test_socket_constant_potential.cpp ../socket_constant_potential.cpp)
 +
  set(socket_json_sources)
  if(ENABLE_JSON)
-   list(APPEND socket_json_sources
-@@ -29,6 +34,7 @@ AddTest(
-           ../socket_driver.cpp
-           ../socket_utils.cpp
-           ../socket_handlers.cpp
-+          ../socket_constant_potential.cpp
-           ../socket_frame_utils.cpp
-           ../socket_frame.cpp
-           ../socket_ipi.cpp
+   list(APPEND socket_json_sources ../../source_io/module_json/abacusjson.cpp
+@@ -30,6 +33,7 @@ addtest(
+   ../socket_driver.cpp
+   ../socket_utils.cpp
+   ../socket_handlers.cpp
++  ../socket_constant_potential.cpp
+   ../socket_frame_utils.cpp
+   ../socket_frame.cpp
+   ../socket_ipi.cpp
+diff --git a/source/source_relax/unittests/test_relax_driver.cpp b/source/source_relax/unittests/test_relax_driver.cpp
+index 3f832eabf..ba017103e 100644
+--- a/source/source_relax/unittests/test_relax_driver.cpp
++++ b/source/source_relax/unittests/test_relax_driver.cpp
+@@ -6,6 +6,7 @@
+ #include "source_relax/relax_driver.h"
+ #include "source_relax/relax_stru_io.h"
+ #include "source_relax/socket_driver.h"
++#include "source_io/module_parameter/parameter.h"
+ 
+ #include "gmock/gmock.h"
+ #include "gtest/gtest.h"
+@@ -105,8 +106,22 @@ void write_stru(UnitCell&,
+ }
+ } // namespace relax_stru_io
+ 
+-void Socket_Driver::socket_driver(ModuleESolver::ESolver*, UnitCell&, const Input_para&, std::ofstream&)
++class TestParameters
+ {
++  public:
++    static Input_para& input(Parameter& parameters) { return parameters.input; }
++};
++
++namespace
++{
++int socket_frame_count = 0;
++}
++
++bool Socket_Driver::socket_driver(ModuleESolver::ESolver* solver, UnitCell& cell,
++                                  Parameter&, const Input_para&, const System_para&, std::ofstream&)
++{
++    for (int step = 0; step < socket_frame_count; ++step) { solver->runner(cell, step); }
++    return socket_frame_count > 0;
+ }
+ 
+ namespace
+@@ -179,6 +194,7 @@ class RelaxDriverTest : public ::testing::Test
+     void SetUp() override
+     {
+         log_file_ = testing::TempDir() + "running.log";
++        socket_frame_count = 0;
+     }
+ 
+     static void make_cell(UnitCell& ucell)
+@@ -212,7 +228,8 @@ class RelaxDriverTest : public ::testing::Test
+ 
+ TEST_F(RelaxDriverTest, RelaxNmaxZeroDoesNotRunESolver)
+ {
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "lbfgs";
+     inp.relax_nmax = 0;
+@@ -224,7 +241,7 @@ TEST_F(RelaxDriverTest, RelaxNmaxZeroDoesNotRunESolver)
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+     testing::internal::CaptureStdout();
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     const std::string output = testing::internal::GetCapturedStdout();
+     ofs.close();
+ 
+@@ -235,7 +252,8 @@ TEST_F(RelaxDriverTest, RelaxNmaxZeroDoesNotRunESolver)
+ 
+ TEST_F(RelaxDriverTest, FirstStepConvergesOnNonSimultaneousPath)
+ {
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "lbfgs";
+     inp.relax_nmax = 3;
+@@ -250,7 +268,7 @@ TEST_F(RelaxDriverTest, FirstStepConvergesOnNonSimultaneousPath)
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+     testing::internal::CaptureStdout();
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     const std::string output = testing::internal::GetCapturedStdout();
+     ofs.close();
+ 
+@@ -262,7 +280,8 @@ TEST_F(RelaxDriverTest, FirstStepConvergesOnNonSimultaneousPath)
+ 
+ TEST_F(RelaxDriverTest, FirstStepConvergesOnSimultaneousPath)
+ {
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "cg";
+     inp.relax_nmax = 3;
+@@ -277,7 +296,7 @@ TEST_F(RelaxDriverTest, FirstStepConvergesOnSimultaneousPath)
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+     testing::internal::CaptureStdout();
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     const std::string output = testing::internal::GetCapturedStdout();
+     ofs.close();
+ 
+@@ -289,7 +308,8 @@ TEST_F(RelaxDriverTest, FirstStepConvergesOnSimultaneousPath)
+ 
+ TEST_F(RelaxDriverTest, MaxStepsMovesFinalNonSimultaneousGeometry)
+ {
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "lbfgs";
+     inp.relax_nmax = 1;
+@@ -304,7 +324,7 @@ TEST_F(RelaxDriverTest, MaxStepsMovesFinalNonSimultaneousGeometry)
+     DriverTestESolver esolver(1.0);
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     ofs.close();
+ 
+     EXPECT_EQ(esolver.runner_count, 1);
+@@ -315,7 +335,8 @@ TEST_F(RelaxDriverTest, MaxStepsMovesFinalNonSimultaneousGeometry)
+ 
+ TEST_F(RelaxDriverTest, MaxStepsStopsOnSimultaneousPath)
+ {
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "cg";
+     inp.relax_nmax = 1;
+@@ -329,7 +350,7 @@ TEST_F(RelaxDriverTest, MaxStepsStopsOnSimultaneousPath)
+     DriverTestESolver esolver(1.0);
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     ofs.close();
+ 
+     EXPECT_EQ(esolver.runner_count, 1);
+@@ -342,7 +363,8 @@ TEST_F(RelaxDriverTest, MaxStepsAfterAllUsesEvaluatedCellRelaxGeometry)
+ {
+     unitcell::allow_cell_change = true;
+ 
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "cell-relax";
+     inp.relax_method = "cg";
+     inp.relax_nmax = 1;
+@@ -361,7 +383,7 @@ TEST_F(RelaxDriverTest, MaxStepsAfterAllUsesEvaluatedCellRelaxGeometry)
+     esolver.set_stress(1.0);
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     ofs.close();
+ 
+     unitcell::allow_cell_change = false;
+@@ -376,7 +398,8 @@ TEST_F(RelaxDriverTest, MaxStepsAfterAllUsesEvaluatedCellRelaxGeometry)
+ 
+ TEST_F(RelaxDriverTest, FinalAllowedStepConvergesAndCallsAfterAllOnce)
+ {
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "lbfgs";
+     inp.relax_nmax = 1;
+@@ -390,7 +413,7 @@ TEST_F(RelaxDriverTest, FinalAllowedStepConvergesAndCallsAfterAllOnce)
+     DriverTestESolver esolver(1.0e-4);
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     ofs.close();
+ 
+     EXPECT_EQ(esolver.runner_count, 1);
+@@ -408,7 +431,8 @@ TEST_F(RelaxDriverTest, ExitStopsBeforeNonSimultaneousRelaxStep)
+         exit_file << "stop_ion true\n";
+     }
+ 
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "lbfgs";
+     inp.relax_nmax = 3;
+@@ -422,7 +446,7 @@ TEST_F(RelaxDriverTest, ExitStopsBeforeNonSimultaneousRelaxStep)
+     DriverTestESolver esolver(1.0);
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     ofs.close();
+ 
+     ASSERT_EQ(::chdir(old_cwd), 0);
+@@ -443,7 +467,8 @@ TEST_F(RelaxDriverTest, ExitStopsBeforeSimultaneousRelaxStep)
+         exit_file << "stop_ion true\n";
+     }
+ 
+-    Input_para inp;
++    Parameter parameters;
++    Input_para& inp = TestParameters::input(parameters);
+     inp.calculation = "relax";
+     inp.relax_method = "cg";
+     inp.relax_nmax = 3;
+@@ -457,7 +482,7 @@ TEST_F(RelaxDriverTest, ExitStopsBeforeSimultaneousRelaxStep)
+     DriverTestESolver esolver(1.0);
+     std::ofstream ofs(log_file_);
+     Relax_Driver driver;
+-    driver.relax_driver(&esolver, ucell, inp, ofs);
++    driver.relax_driver(&esolver, ucell, parameters, ofs);
+     ofs.close();
+ 
+     ASSERT_EQ(::chdir(old_cwd), 0);
+@@ -468,3 +493,32 @@ TEST_F(RelaxDriverTest, ExitStopsBeforeSimultaneousRelaxStep)
+ }
+ 
+ } // namespace
++
++TEST_F(RelaxDriverTest, SocketWithoutCompletedFrameSkipsFinalization)
++{
++    Parameter parameters;
++    TestParameters::input(parameters).socket_driver = true;
++    UnitCell cell;
++    make_cell(cell);
++    DriverTestESolver solver(0.0);
++    std::ofstream output(log_file_);
++    Relax_Driver driver;
++    driver.relax_driver(&solver, cell, parameters, output);
++    EXPECT_EQ(solver.runner_count, 0);
++    EXPECT_EQ(solver.after_all_count, 0);
++}
++
++TEST_F(RelaxDriverTest, SocketCompletedFramesFinalizeOnce)
++{
++    Parameter parameters;
++    TestParameters::input(parameters).socket_driver = true;
++    socket_frame_count = 2;
++    UnitCell cell;
++    make_cell(cell);
++    DriverTestESolver solver(0.0);
++    std::ofstream output(log_file_);
++    Relax_Driver driver;
++    driver.relax_driver(&solver, cell, parameters, output);
++    EXPECT_EQ(solver.runner_count, 2);
++    EXPECT_EQ(solver.after_all_count, 1);
++}
 diff --git a/source/source_relax/unittests/test_socket_constant_potential.cpp b/source/source_relax/unittests/test_socket_constant_potential.cpp
 new file mode 100644
-index 0000000..9d1e12a
+index 000000000..9d1e12a3a
 --- /dev/null
 +++ b/source/source_relax/unittests/test_socket_constant_potential.cpp
 @@ -0,0 +1,127 @@
@@ -2319,31 +2802,33 @@ index 0000000..9d1e12a
 +    EXPECT_EQ("{\"fermi_level_eV\":-0.25,\"nelect\":8.125}", json);
 +}
 diff --git a/source/source_relax/unittests/test_socket_driver.cpp b/source/source_relax/unittests/test_socket_driver.cpp
-index 95b338c..a38a116 100644
+index 50e5fe255..4e988642f 100644
 --- a/source/source_relax/unittests/test_socket_driver.cpp
 +++ b/source/source_relax/unittests/test_socket_driver.cpp
-@@ -1,11 +1,17 @@
+@@ -1,9 +1,17 @@
+ #include "for_test.h"
++#ifdef __MPI
+ #include "mpi.h"
++#endif
++#include "source_base/constants.h"
+ #include "source_cell/unitcell.h"
+ #include "source_esolver/esolver.h"
++#include "source_hamilt/module_xc/xc_functional.h"
+ #include "source_io/module_parameter/input_parameter.h"
++#include "source_io/module_parameter/parameter.h"
++#include "source_relax/socket_constant_potential.h"
  #include "source_relax/socket_driver.h"
 +#include "source_relax/socket_handlers.h"
 +#include "source_relax/socket_utils.h"
  
  #include "gmock/gmock.h"
  #include "gtest/gtest.h"
-+#include "source_base/constants.h"
-+#ifdef __MPI
- #include "mpi.h"
-+#endif
- #include "source_cell/unitcell.h"
- #include "source_esolver/esolver.h"
- #include "source_io/module_parameter/input_parameter.h"
-+#include "source_io/module_parameter/parameter.h"
- #include "for_test.h"
- 
- #include <cerrno>
-@@ -25,6 +31,12 @@
+@@ -24,6 +32,14 @@
  #include <sys/wait.h>
  #include <unistd.h>
  
++int XC_Functional::func_type = 2;
++
 +class TestParameters
 +{
 +  public:
@@ -2353,7 +2838,7 @@ index 95b338c..a38a116 100644
  namespace
  {
  constexpr std::size_t kIpiHeaderLen = 12;
-@@ -245,6 +257,68 @@ class FakeESolver : public ModuleESolver::ESolver
+@@ -244,6 +260,68 @@ class FakeESolver : public ModuleESolver::ESolver
      bool converged_;
  };
  
@@ -2363,8 +2848,8 @@ index 95b338c..a38a116 100644
 +    ElectronicObservablesSolver() : FakeESolver(true) {}
 +
 +    bool electronic_observables(const UnitCell&, const Parameter&,
-+                               const ModuleESolver::PotentialWindow& window,
-+                               ModuleESolver::ElectronicObservables& result) const override
++                               const elecstate::PotentialWindow& window,
++                               elecstate::ElectronicObservables& result) const override
 +    {
 +        ++collection_count;
 +        last_window = window;
@@ -2372,10 +2857,10 @@ index 95b338c..a38a116 100644
 +        return supported;
 +    }
 +
-+    ModuleESolver::ElectronicObservables physical;
++    elecstate::ElectronicObservables physical;
 +    bool supported = true;
 +    mutable int collection_count = 0;
-+    mutable ModuleESolver::PotentialWindow last_window;
++    mutable elecstate::PotentialWindow last_window;
 +};
 +
 +class ControlledESolver : public FakeESolver
@@ -2383,7 +2868,7 @@ index 95b338c..a38a116 100644
 +  public:
 +    ControlledESolver() : FakeESolver(true) {}
 +
-+    bool apply_electronic_control(Parameter&, const ModuleESolver::ElectronicControl& control) override
++    bool apply_electronic_control(Parameter&, const elecstate::ElectronicControl& control) override
 +    {
 +        nelect = control.nelect;
 +        ++control_count;
@@ -2404,8 +2889,8 @@ index 95b338c..a38a116 100644
 +    double cal_energy() override { return FakeESolver::cal_energy() + nelect; }
 +
 +    bool electronic_observables(const UnitCell&, const Parameter&,
-+                               const ModuleESolver::PotentialWindow&,
-+                               ModuleESolver::ElectronicObservables& result) const override
++                               const elecstate::PotentialWindow&,
++                               elecstate::ElectronicObservables& result) const override
 +    {
 +        ++collection_count;
 +        result.nelect = nelect;
@@ -2422,7 +2907,7 @@ index 95b338c..a38a116 100644
  struct DriverResult
  {
      int exit_code = -1;
-@@ -383,10 +457,8 @@ std::string read_pipe(const int fd)
+@@ -379,10 +457,8 @@ std::string read_pipe(const int fd)
      return output;
  }
  
@@ -2435,7 +2920,7 @@ index 95b338c..a38a116 100644
  {
      UnixSocketServer server;
      int output_pipe[2];
-@@ -410,15 +482,7 @@ DriverResult run_driver_frame(const bool converged,
+@@ -406,15 +482,7 @@ DriverResult run_driver_frame(const bool converged,
          ::close(output_pipe[1]);
          ::setenv("ABACUS_SOCKET_ADDRESS", server.address().c_str(), 1);
  
@@ -2452,7 +2937,7 @@ index 95b338c..a38a116 100644
          std::cout.flush();
          std::cerr.flush();
          ::_exit(0);
-@@ -438,7 +502,6 @@ DriverResult run_driver_frame(const bool converged,
+@@ -434,7 +502,6 @@ DriverResult run_driver_frame(const bool converged,
          {
              throw std::runtime_error(errno_message("setsockopt failed"));
          }
@@ -2460,7 +2945,7 @@ index 95b338c..a38a116 100644
          peer_action(peer_fd);
      }
      catch (...)
-@@ -471,8 +534,175 @@ DriverResult run_driver_frame(const bool converged,
+@@ -467,8 +534,239 @@ DriverResult run_driver_frame(const bool converged,
      }
      return result;
  }
@@ -2496,10 +2981,17 @@ index 95b338c..a38a116 100644
 +        input.cal_force = true;
 +        input.cal_stress = false;
 +        input.symmetry = "0";
++        input.esolver_type = "ksdft";
++        input.basis_type = "pw";
++        input.device = "cpu";
++        input.precision = "double";
++        input.nspin = 1;
++        input.nbands = 8;
++        input.smearing_method = "gaussian";
 +        ControlledESolver solver;
 +        std::ofstream running("/dev/null");
 +        Socket_Driver driver;
-+        driver.socket_driver(&solver, cell, parameters, running);
++        driver.socket_driver(&solver, cell, parameters, parameters.inp, parameters.globalv, running);
 +        std::cout << "CP calls: " << solver.control_count << " controls, "
 +                  << solver.runner_count << " runners, " << solver.collection_count
 +                  << " collections\n";
@@ -2518,6 +3010,63 @@ index 95b338c..a38a116 100644
 +}
  } // namespace
  
++TEST(SocketDriverTest, RejectedElectronicStepLeavesSolverUntouched)
++{
++    UnitCell cell;
++    initialize_one_atom_cell(cell);
++    Parameter parameters;
++    // Configuration comes from the explicit references, not the opaque handle.
++    Input_para input;
++    System_para system;
++    input.esolver_type = "ksdft";
++    input.basis_type = "pw";
++    input.device = "cpu";
++    input.precision = "double";
++    input.nspin = 1;
++    input.nbands = 8;
++    input.smearing_method = "gaussian";
++    ControlledESolver solver;
++    elecstate::ElectronicControl request;
++    request.nelect = 8.25;
++
++    input.assume_isolated = "makov-payne";
++    try
++    {
++        SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 2, 0);
++        FAIL() << "Makov-Payne request reached the solver";
++    }
++    catch (const std::runtime_error& error)
++    {
++        EXPECT_THAT(error.what(), testing::HasSubstr("energy-only Makov-Payne"));
++    }
++    input.assume_isolated = "none";
++    input.nbands = 4;
++    EXPECT_THROW(SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 2, 0), std::runtime_error);
++    input.nbands = 8;
++    input.smearing_method = "fixed";
++    EXPECT_THROW(SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 2, 0), std::runtime_error);
++    input.smearing_method = "gaussian";
++    system.use_uspp = true;
++    EXPECT_THROW(SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 2, 0), std::runtime_error);
++    system.use_uspp = false;
++    system.two_fermi = true;
++    EXPECT_THROW(SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 2, 0), std::runtime_error);
++    system.two_fermi = false;
++    EXPECT_THROW(SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 0, 0), std::runtime_error);
++    EXPECT_EQ(0, solver.control_count);
++    EXPECT_EQ(0, solver.runner_count);
++    EXPECT_DOUBLE_EQ(0.0, solver.nelect);
++
++    input.smearing_method = "gaussian";
++    SocketCP::run_electronic_step(solver, cell, parameters, input, system, request, 2, 0);
++    EXPECT_EQ(1, solver.control_count);
++    EXPECT_EQ(1, solver.runner_count);
++    EXPECT_DOUBLE_EQ(8.25, solver.nelect);
++
++    FakeESolver unsupported(true);
++    EXPECT_THROW(SocketCP::run_electronic_step(unsupported, cell, parameters, input, system, request, 2, 0), std::runtime_error);
++}
++
 +TEST(SocketDriverTest, ConstantPotentialFramesApplyChargeBeforeEvaluation)
 +{
 +    const DriverResult result = run_constant_potential_session([](const int fd) {
@@ -2636,7 +3185,7 @@ index 95b338c..a38a116 100644
  TEST(SocketDriverTest, NonconvergedFrameIsPublishedWithMetadata)
  {
      ForceResponse response;
-@@ -603,6 +833,31 @@ TEST(SocketDriverTest, ConsumedFrameCannotBeReturnedTwice)
+@@ -579,6 +877,31 @@ TEST(SocketDriverTest, ConsumedFrameCannotBeReturnedTwice)
      EXPECT_THAT(result.diagnostic, testing::HasSubstr("GETFORCE requires HAVEDATA"));
  }
  
@@ -2668,7 +3217,7 @@ index 95b338c..a38a116 100644
  TEST(SocketDriverTest, InvalidNextFrameCannotReturnPreviousResults)
  {
      const DriverResult result = run_driver_frame(true, true, false, [&](const int fd) {
-@@ -617,9 +872,13 @@ TEST(SocketDriverTest, InvalidNextFrameCannotReturnPreviousResults)
+@@ -593,9 +916,13 @@ TEST(SocketDriverTest, InvalidNextFrameCannotReturnPreviousResults)
  
  int main(int argc, char** argv)
  {

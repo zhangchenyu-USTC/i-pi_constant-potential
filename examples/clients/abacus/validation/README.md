@@ -4,6 +4,12 @@ This directory contains the Si2 PW/LCAO examples, the Al36 electrode
 examples, and the real-client regression suite. ABACUS keeps the focused
 C++ unit tests alongside its source.
 
+The current `abacus-develop-constant-potential.patch` uses upstream commit
+`d20090cc137fdc3b3baddd9217f792bb7af922d7`. Build the reference from that commit
+and apply the patch only to the candidate. The beta10 patch in main uses its
+separate beta10 baseline. Earlier validation commits remain available at their
+fixed links.
+
 ## Run an example
 
 From this directory, set the executable and data paths:
@@ -47,8 +53,8 @@ bash tests/run_develop_core.sh /path/to/new-test-output
 ```
 
 Both executables should use the same compiler, MPI library, and optional
-features. For the develop patch, build both from the baseline recorded in
-the [client README](../README.md), applying the patch only to the candidate.
+features. For the develop patch, build both from the fixed baseline above,
+applying the patch only to the candidate.
 Load their runtime libraries in the shell before running the tests. Use this
 i-PI checkout for the server as well as the examples.
 
@@ -75,3 +81,20 @@ For a focused run, invoke `python -m pytest tests/test_socket_driver.py` with
 the same environment. Set `ABACUS_TEST_RANKS=1` for serial checks, or use
 `ABACUS_TEST_RANKS=4` for the full suite's parallel cases. The reference
 executable is a separate, unmodified ABACUS build.
+
+## Focused C++ checks
+
+After configuring ABACUS with MPI and `BUILD_TESTING=ON`, build and run the
+electronic-control tests using their current module names:
+
+```bash
+cmake --build build --target MODULE_ESTATE_electronic_occupations_test \
+  MODULE_ESTATE_electrostatic_potential_test MODULE_RELAX_socket_driver_test \
+  MODULE_RELAX_socket_constant_potential_test
+OMP_NUM_THREADS=1 ctest --test-dir build --output-on-failure \
+  -R 'electronic_occupations|electrostatic_potential|MODULE_RELAX_socket_(driver|constant_potential)'
+```
+
+This selects six CTest targets, including MPI 1/4 occupation and potential
+averaging tests. The socket tests cover request validation before SCF and
+electron updates across consecutive frames.

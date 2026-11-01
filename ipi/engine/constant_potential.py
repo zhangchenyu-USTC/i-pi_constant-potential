@@ -266,8 +266,6 @@ class ConstantPotentialSocketMixin:
     def _init_constant_potential(self):
         self.constant_potential_capable = True
         self.charge_enabled = False
-        self.mixing_enabled = False
-        self.Ne_doping = False
         self.current_nelect = None
         self.neutral_electrons = None
         self.electrons_config = None
@@ -311,8 +309,6 @@ class ConstantPotentialSocketMixin:
             )
         self._validate_transport()
         self.charge_enabled = True
-        self.mixing_enabled = False
-        self.Ne_doping = bool(electrons_config.get("Ne_doping", False)) and not endpoint
         self.neutral_electrons = int(electrons_config["neutral_electrons"])
         self.electrons_config = electrons_config
         self._dynamics_ref = dynamics
@@ -330,9 +326,6 @@ class ConstantPotentialSocketMixin:
         if self._dynamics_ref is None:
             raise RuntimeError("Constant-potential socket is not bound to Dynamics.")
         return self._dynamics_ref
-
-    def _mode_flags(self):
-        return 2 if self.Ne_doping else 0
 
     def _prepare_request(self, request, request_context):
         request = super()._prepare_request(request, request_context)
@@ -369,34 +362,6 @@ class ConstantPotentialSocketMixin:
         request["nelect"] = snapshot.nelect
         request["mode_flags"] = snapshot.mode_flags
         return request
-
-    def validate_extras(self, extras, expected_nelect=None, context=None):
-        context = context or f"FFSocket '{self.name}' extras"
-        dynamics = self._require_dynamics()
-        nbeads = int(getattr(getattr(dynamics, "beads", None), "nbeads", 1))
-        fermi_values = finite_values(extras, "fermi_level_eV", context)
-        returned = finite_values(extras, "nelect", context)
-        if fermi_values.size != nbeads or returned.size != nbeads:
-            raise RuntimeError(
-                f"{context} must contain one scalar fermi_level_eV and nelect per bead."
-            )
-        fermi = float(np.mean(fermi_values))
-        expected = self.current_nelect if expected_nelect is None else expected_nelect
-        if expected is None or np.any(np.abs(returned - float(expected)) > 1.0e-8):
-            raise RuntimeError(
-                f"{context} report electron numbers inconsistent with CHGDATA "
-                f"(expected {expected!r}, received {returned.tolist()})."
-            )
-        state = dynamics.electronic_state
-        workfunction = None
-        if state.mode == "workfunction":
-            values = finite_values(extras, "workfunction_eV", context)
-            if values.size != nbeads:
-                raise RuntimeError(
-                    f"{context} must contain one scalar workfunction_eV per bead."
-                )
-            workfunction = float(np.mean(values))
-        return fermi, workfunction
 
     def update(self):
         super().update()

@@ -80,9 +80,6 @@ class FFChargeMixTwoSockets(ForceField):
         if fraction < -1.0e-10 or fraction > 1.0 + 1.0e-10:
             raise ValueError("Charge-mixing interpolation fraction is outside [0, 1].")
         self.current_nelect = value
-        self.q_low = low
-        self.q_high = high
-        self.lambda_val = min(max(fraction, 0.0), 1.0)
         self.endpoint_low.set_electronic_state(float(low))
         self.endpoint_high.set_electronic_state(float(high))
 

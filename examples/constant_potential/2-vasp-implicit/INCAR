@@ -40,3 +40,5 @@ IBRION = 24
 IHOST  = localhost
 PORT   = 17000
 INET   = 1
+
+SOL_UPDATE = 5

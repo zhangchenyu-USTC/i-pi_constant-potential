@@ -7,6 +7,7 @@ from ipi.engine.constant_potential import (
     ElectronicRequestContext,
     append_init_token,
     mean_extra,
+    read_constant_potential_feedback,
 )
 from ipi.engine.atoms import Atoms
 from ipi.engine.cell import Cell
@@ -311,9 +312,12 @@ def test_flags_do_not_depend_on_step(ne_mode, expected):
         {"enabled": True, "neutral_electrons": 8, "Ne_doping": ne_mode},
         dynamics=SimpleNamespace(electronic_state=electronic_state),
     )
+    forcefield.set_electronic_state(electronic_state.q)
     for step in (0, 1, 5, 100):
         electronic_state.current_step = step
-        assert forcefield._mode_flags() == expected
+        request = forcefield.queue(Atoms(1), Cell(np.eye(3)))
+        assert request["mode_flags"] == expected
+        forcefield.release(request)
 
 
 def test_electronic_drift_synchronizes_charge():
@@ -360,9 +364,7 @@ def test_span_two_uses_global_even_lattice_and_mixes():
     wrapper.endpoint_low.set_electronic_state = lambda q: setattr(low, "q", q)
     wrapper.endpoint_high.set_electronic_state = lambda q: setattr(high, "q", q)
     wrapper.set_electronic_state(107.5)
-    assert (wrapper.q_low, wrapper.q_high, wrapper.lambda_val) == pytest.approx(
-        (106, 108, 0.75)
-    )
+    assert (low.q, high.q) == (106.0, 108.0)
     snapshot = ElectronicRequestContext(107.5, 0, "workfunction", id(dynamics))
     request = {
         "lambda": 0.75,
@@ -423,7 +425,6 @@ def test_charge_mixing_chgdata_endpoints_are_integers(span, q, expected):
     wrapper.charge_mixing_span = span
     wrapper.set_electronic_state(q)
 
-    assert (wrapper.q_low, wrapper.q_high) == expected
     assert low.q == float(expected[0])
     assert high.q == float(expected[1])
     assert low.q.is_integer() and high.q.is_integer()
@@ -621,28 +622,23 @@ def test_constant_potential_socket_cannot_be_shared_by_systems():
 
 
 def test_socket_extras_require_one_scalar_per_bead():
-    interface = SimpleNamespace(
-        mode="inet",
-        batch_size=1,
-        consolidate_messages=True,
-        requests=None,
-        offset=0.0,
+    component = SimpleNamespace(
+        weight=1.0,
+        mts_weights=[1.0],
+        extras={
+            "fermi_level_eV": [[-0.2, -0.2], [-0.2, -0.2]],
+            "nelect": [[7.5, 7.5], [7.5, 7.5]],
+        },
     )
-    forcefield = FFSocket(name="strict", interface=interface)
     dynamics = SimpleNamespace(
-        electronic_state=state(), beads=SimpleNamespace(nbeads=2)
+        electronic_state=state(),
+        beads=SimpleNamespace(nbeads=2),
+        ensemble=SimpleNamespace(hweights=[]),
+        _electronic_provider_component=component,
+        _electronic_provider_index=0,
     )
-    forcefield.configure_electrons(
-        {"enabled": True, "neutral_electrons": 8}, dynamics=dynamics
-    )
-    forcefield.set_electronic_state(7.5)
     with pytest.raises(RuntimeError, match="one scalar"):
-        forcefield.validate_extras(
-            {
-                "fermi_level_eV": [[-0.2, -0.2], [-0.2, -0.2]],
-                "nelect": [[7.5, 7.5], [7.5, 7.5]],
-            }
-        )
+        read_constant_potential_feedback(dynamics)
 
 
 def test_single_socket_ring_polymer_contraction_is_rejected_at_bind(monkeypatch):
