@@ -326,6 +326,10 @@ def test_charge_and_position_sequence(tmp_path, basis):
 
 def cube_average(directory, axis, minimum=2.0, maximum=4.0):
     lines = (directory / "OUT.ABACUS/potes.cube").read_text().splitlines()
+    return _cube_average(lines, axis, minimum, maximum)
+
+
+def _cube_average(lines, axis, minimum=2.0, maximum=4.0):
     nat = abs(int(lines[2].split()[0]))
     grid = [int(line.split()[0]) for line in lines[3:6]]
     steps = np.array([[float(v) for v in line.split()[1:4]] for line in lines[3:6]])
@@ -348,6 +352,115 @@ def cube_average(directory, axis, minimum=2.0, maximum=4.0):
         )
         * RY_EV
     )
+
+
+def cube_frames(path):
+    """Read complete native cube frames, including the ionic-step labels."""
+    lines = path.read_text().splitlines()
+    starts = [
+        index for index, line in enumerate(lines) if line.startswith("Ionic_Step ")
+    ]
+    assert starts and starts[0] == 0, f"Missing ionic-step header: {path}"
+    for start, stop in zip(starts, starts[1:] + [len(lines)]):
+        frame = lines[start:stop]
+        assert len(frame) >= 6, f"Incomplete cube header: {path}"
+        step = int(frame[0].split()[1])
+        nat = abs(int(frame[2].split()[0]))
+        grid = [int(line.split()[0]) for line in frame[3:6]]
+        assert step > 0 and min(grid) > 0
+        values = [float(value) for line in frame[6 + nat :] for value in line.split()]
+        assert len(values) == np.prod(
+            grid
+        ), f"Incomplete cube data: {path}, step {step}"
+        assert np.isfinite(values).all()
+        yield step, frame
+
+
+@pytest.mark.parametrize("basis", ["pw", "lcao"])
+@pytest.mark.parametrize("output_mode", [0, 1, 2])
+def test_socket_output_modes(tmp_path, basis, output_mode):
+    inputs(tmp_path, basis, extra={"out_app_flag": output_mode, "out_freq_ion": 2})
+    output = tmp_path / "OUT.ABACUS"
+
+    def snapshot():
+        return {
+            str(path.relative_to(output)): path.read_bytes()
+            for path in output.rglob("potes*.cube")
+        }
+
+    def check_output(expected, results):
+        files = snapshot()
+        assert set(files) == set(expected)
+        for name, steps in expected.items():
+            frames = list(cube_frames(output / name))
+            assert [step for step, _ in frames] == steps
+            for step, frame in frames:
+                average = _cube_average(frame, 2)
+                assert abs(average - results[step]["electrostatic_reference_eV"]) < 1e-4
+        return files
+
+    results = {}
+    previous_files = {}
+    with Client(tmp_path) as client:
+        client.initialize()
+        for step, q in enumerate([8.0, 8.2, 7.8, 8.1], start=1):
+            positions = POSITIONS.copy()
+            positions[1] += np.array([0.03, -0.02, 0.01]) * (step - 1)
+            result = client.calculate(q, positions=positions)
+            results[step] = result[3]
+            assert result[3]["nelect"] == pytest.approx(q, abs=1e-8, rel=0)
+            assert np.isfinite(
+                [
+                    result[3][key]
+                    for key in (
+                        "fermi_level_eV",
+                        "workfunction_eV",
+                        "electrostatic_reference_eV",
+                    )
+                ]
+            ).all()
+            assert result[3]["workfunction_eV"] == pytest.approx(
+                result[3]["electrostatic_reference_eV"] - result[3]["fermi_level_eV"],
+                abs=1e-4,
+                rel=0,
+            )
+            written = list(range(1, step + 1, 2))
+            if output_mode == 2:
+                expected = {f"POT/potesg{i}.cube": [i] for i in written}
+            else:
+                expected = {"potes.cube": written if output_mode == 1 else written[-1:]}
+            files = check_output(expected, results)
+            if step % 2 == 0:
+                assert files == previous_files
+                reference_directory = tmp_path / f"reference_{step}"
+                reference = standalone(reference_directory, basis, q, positions)
+                reference_potential = cube_average(reference_directory, 2)
+                assert abs(result[0] - reference[0]) < 1e-6
+                assert np.max(np.abs(result[1] - reference[1])) < 1e-5
+                assert abs(result[3]["fermi_level_eV"] - reference[2]) < 1e-4
+                assert (
+                    abs(result[3]["electrostatic_reference_eV"] - reference_potential)
+                    < 1e-4
+                )
+                assert (
+                    abs(
+                        result[3]["workfunction_eV"]
+                        - (reference_potential - reference[2])
+                    )
+                    < 1e-4
+                )
+            assert client.status() == client.status() == "READY"
+            assert snapshot() == files
+            previous_files = files
+        client.finish()
+
+    if output_mode == 1:
+        with Client(tmp_path) as client:
+            client.initialize()
+            result = client.calculate(8.05)
+            assert result[3]["nelect"] == pytest.approx(8.05, abs=1e-8, rel=0)
+            check_output({"potes.cube": [1]}, {1: result[3]})
+            client.finish()
 
 
 @pytest.mark.parametrize(

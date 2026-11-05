@@ -24,6 +24,7 @@ fi
 python -m pytest -p no:cacheprovider -v "${CP_PYTEST_OPTIONS[@]}" \
     "$CP_TEST_DIRECTORY/test_socket_driver.py::test_charge_and_position_sequence" \
     "$CP_TEST_DIRECTORY/test_socket_driver.py::test_workfunction_matches_cube_on_triclinic_cell" \
+    "$CP_TEST_DIRECTORY/test_socket_driver.py::test_socket_output_modes" \
     "$CP_TEST_DIRECTORY/test_socket_driver.py::test_ordinary_socket_default_symmetry_and_multiple_positions" \
     "$CP_TEST_DIRECTORY/test_socket_driver.py::test_zero_request_exit" \
     "$CP_TEST_DIRECTORY/test_socket_driver.py::test_invalid_requests_fail_without_results[missing_charge]" \
