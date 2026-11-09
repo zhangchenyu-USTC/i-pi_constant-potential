@@ -4,11 +4,14 @@ This directory contains the Si2 PW/LCAO examples, the Al36 electrode
 examples, and the real-client regression suite. ABACUS keeps the focused
 C++ unit tests alongside its source.
 
-The current `abacus-develop-constant-potential.patch` uses upstream commit
-`d20090cc137fdc3b3baddd9217f792bb7af922d7`. Build the reference from that commit
-and apply the patch only to the candidate. The beta10 patch in main uses its
-separate beta10 baseline. Earlier validation commits remain available at their
-fixed links.
+The current PR source uses upstream commit
+`e58ffe5e40f8e70713aa879f40da07fe591d5294`. It passes each electronic request
+through a temporary, non-owning `UnitCell` pointer instead of adding ESolver
+interfaces. The included `abacus-develop-constant-potential.patch` remains on
+`d20090cc137fdc3b3baddd9217f792bb7af922d7` and does not contain this refactor.
+The beta10 patch in main uses its separate beta10 baseline. Build the original
+reference from the same upstream revision as the candidate being tested.
+Earlier validation commits remain available at their fixed links.
 
 ## Run an example
 
@@ -53,13 +56,15 @@ bash tests/run_develop_core.sh /path/to/new-test-output
 ```
 
 Both executables should use the same compiler, MPI library, and optional
-features. For the develop patch, build both from the fixed baseline above,
-applying the patch only to the candidate.
+features. For the current PR, use the e58 baseline; for the included develop
+patch, use d200 and apply the patch only to the candidate.
 Load their runtime libraries in the shell before running the tests. Use this
 i-PI checkout for the server as well as the examples.
 
-`run_develop_core.sh` selects **46 checks** for the develop patch, including the
-Makov–Payne electronic-control rejection and ordinary SCF/socket comparisons.
+`run_develop_core.sh` currently selects **52 checks**: 46 core checks and six
+PW/LCAO output-mode checks. These include Makov–Payne electronic-control
+rejection, ordinary SCF/socket comparisons, and `out_app_flag=0/1/2` with
+`out_freq_ion=2` on the current PR baseline.
 They cover dynamic electron counts and positions,
 static references, cube potentials, ordinary SCF/MD/relax and socket sessions,
 native implicit solvent, k-point pools, ASE, i-PI trajectories, and restart.
@@ -81,6 +86,30 @@ For a focused run, invoke `python -m pytest tests/test_socket_driver.py` with
 the same environment. Set `ABACUS_TEST_RANKS=1` for serial checks, or use
 `ABACUS_TEST_RANKS=4` for the full suite's parallel cases. The reference
 executable is a separate, unmodified ABACUS build.
+
+## Compare the electronic-step refactor
+
+Keep the executable and data paths above, with the current PR as the candidate
+and unmodified e58 as the reference. Set the additional executable to a build
+of PR commit `977f6b8770ec5f1c9e9721728a828ebf6fa7d717`, before this refactor:
+
+```bash
+export ABACUS_PREVIOUS_EXECUTABLE=/path/to/pre-refactor/abacus
+export ABACUS_TEST_IPI_ROOT=/path/to/i-pi-constant-potential
+export ABACUS_REQUIRE_REAL_TESTS=1 ABACUS_TEST_RANKS=4
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+python -m pytest -p no:cacheprovider -v \
+  tests/test_socket_driver.py::test_electronic_step_matches_previous_binary \
+  --basetemp=/path/to/new-before-after-work \
+  --junitxml=/path/to/before-after.xml
+```
+
+The four PW/LCAO, solvent-on/off cases compare five frames each, including a
+coordinate change at unchanged electron count. The local validation passed
+all four cases: the 20 frame pairs had zero differences in energy, forces,
+occupations, Fermi level, reference potential, and work function. Reference
+potential sampling stays after force evaluation, preserving the electric-field
+state used for forces. These four checks are separate from the 52 core checks.
 
 ## Focused C++ checks
 

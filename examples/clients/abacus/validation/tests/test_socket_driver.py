@@ -324,6 +324,79 @@ def test_charge_and_position_sequence(tmp_path, basis):
     (tmp_path / "comparison.json").write_text(json.dumps(errors, indent=2))
 
 
+@pytest.mark.skipif(
+    not os.environ.get("ABACUS_PREVIOUS_EXECUTABLE"),
+    reason="pre-refactor ABACUS executable not configured",
+)
+@pytest.mark.parametrize("basis", ["pw", "lcao"])
+@pytest.mark.parametrize("solvent", [0, 1])
+def test_electronic_step_matches_previous_binary(tmp_path, basis, solvent):
+    """Compare the same requests, including changed positions at unchanged N."""
+    trajectories = {}
+    for label, binary in (
+        ("before", os.environ["ABACUS_PREVIOUS_EXECUTABLE"]),
+        ("after", BINARY),
+    ):
+        directory = tmp_path / label
+        inputs(
+            directory,
+            basis,
+            extra={
+                "gate_flag": 1,
+                "zgate": 0.75,
+                "efield_flag": 1,
+                "dip_cor_flag": 1,
+                "efield_pos_max": 0.9,
+                "efield_pos_dec": 0.1,
+                "imp_sol": solvent,
+                "out_pot": 0,
+            },
+        )
+        frames = []
+        with Client(directory, binary=binary) as client:
+            client.initialize()
+            for index, count in enumerate([8.0, 8.2, 8.2, 7.8, 8.0]):
+                positions = POSITIONS.copy()
+                if index >= 2:
+                    positions[1] += [0.08, -0.04, 0.02]
+                energy, forces, virial, extras = client.calculate(
+                    count, positions=positions, consolidated=index % 2 == 0
+                )
+                assert extras["nelect"] == pytest.approx(count, abs=1e-8, rel=0)
+                frames.append(
+                    {
+                        "energy": energy,
+                        "forces": forces.tolist(),
+                        "virial": virial.tolist(),
+                        "extras": extras,
+                    }
+                )
+            client.finish()
+        trajectories[label] = frames
+    errors = []
+    for before, after in zip(trajectories["before"], trajectories["after"]):
+        delta = {
+            "energy_Ha": abs(before["energy"] - after["energy"]),
+            "force_Ha_Bohr": float(
+                np.max(np.abs(np.array(before["forces"]) - after["forces"]))
+            ),
+        }
+        assert delta["energy_Ha"] < 1e-6
+        assert delta["force_Ha_Bohr"] < 1e-5
+        for name in (
+            "nelect",
+            "fermi_level_eV",
+            "electrostatic_reference_eV",
+            "workfunction_eV",
+        ):
+            delta[name] = abs(before["extras"][name] - after["extras"][name])
+            assert delta[name] < (1e-8 if name == "nelect" else 1e-4)
+        errors.append(delta)
+    (tmp_path / "before-after.json").write_text(
+        json.dumps({"trajectories": trajectories, "errors": errors}, indent=2) + "\n"
+    )
+
+
 def cube_average(directory, axis, minimum=2.0, maximum=4.0):
     lines = (directory / "OUT.ABACUS/potes.cube").read_text().splitlines()
     return _cube_average(lines, axis, minimum, maximum)
