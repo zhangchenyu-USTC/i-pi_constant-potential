@@ -63,7 +63,8 @@ def test_fixed_cell_ase_energy_forces_without_stress(tmp_path, basis):
             assert calculator.last_scf_converged is True
         assert abs(values[1] - values[0]) > 1e-8
     text = (tmp_path / "OUT.ABACUS/running_scf.log").read_text()
-    assert text.count("Sending extras JSON") == 2
+    assert text.count("#SCF IS CONVERGED#") == 2
+    assert "Sending extras JSON" not in text
 
 
 def test_ase_socket_input_preserves_independent_properties():

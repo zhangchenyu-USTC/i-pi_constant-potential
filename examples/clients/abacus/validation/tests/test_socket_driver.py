@@ -28,6 +28,11 @@ BOHR_A = 0.5291770
 RY_BOHR3_TO_KBAR = (4.35974394e-18 / 2.0) / (0.529177e-10**3) * 1e-8
 CELL = np.eye(3) * 10.26
 POSITIONS = np.array([[0.0, 0.0, 0.0], [2.4, 2.4, 2.4]])
+SOCKET_ADAPTERS = [
+    pytest.param("pw", 0, id="pw"),
+    pytest.param("lcao", 0, id="lcao"),
+    pytest.param("lcao", 1, id="lcao-gamma"),
+]
 
 
 def header(name):
@@ -203,6 +208,9 @@ class Client:
         nat = struct.unpack("=i", self.read(4))[0]
         force = np.frombuffer(self.read(24 * nat), dtype="=f8").copy().reshape(nat, 3)
         virial = np.frombuffer(self.read(72), dtype="=f8").copy().reshape(3, 3)
+        assert np.isfinite(energy)
+        assert np.all(np.isfinite(force))
+        assert np.all(np.isfinite(virial))
         size = struct.unpack("=i", self.read(4))[0]
         extras = json.loads(self.read(size))
         metadata = {"schema", "present", "scf_converged"}
@@ -224,6 +232,7 @@ class Client:
         if nelect is not None:
             assert extras["scf_converged"]
             assert extras["present"] == ["energy", "forces"]
+            assert all(np.isfinite(extras[key]) for key in electronic)
         assert self.status() == "READY"
         return energy, force, virial, extras
 
@@ -256,8 +265,9 @@ class Client:
         self.close()
 
 
-def standalone(directory, basis, nelect, positions, *, extra=None):
-    if not REFERENCE:
+def standalone(directory, basis, nelect, positions, *, extra=None, binary=None):
+    binary = binary or REFERENCE
+    if not binary:
         raise RuntimeError(
             "ABACUS_REFERENCE_EXECUTABLE must select an independent ordinary build"
         )
@@ -265,7 +275,7 @@ def standalone(directory, basis, nelect, positions, *, extra=None):
     inputs(directory, basis, positions=positions, socket_mode=False, extra=options)
     with (directory / "abacus.log").open("w") as log:
         subprocess.run(
-            command(REFERENCE),
+            command(binary),
             cwd=directory,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -296,20 +306,23 @@ def standalone(directory, basis, nelect, positions, *, extra=None):
     return energy, forces * BOHR_A / (2 * RY_EV), fermi
 
 
-@pytest.mark.parametrize("basis", ["pw", "lcao"])
-def test_charge_and_position_sequence(tmp_path, basis):
-    inputs(tmp_path / "socket", basis)
+@pytest.mark.parametrize("basis,gamma_only", SOCKET_ADAPTERS)
+def test_charge_and_position_sequence(tmp_path, basis, gamma_only):
+    options = {"gamma_only": gamma_only}
+    inputs(tmp_path / "socket", basis, extra=options)
     errors = []
     with Client(
         tmp_path / "socket", transport="inet" if basis == "lcao" else "unix"
     ) as client:
         client.initialize()
-        for index, q in enumerate([8.0, 8.2, 7.8, 8.0]):
+        for index, q in enumerate([8.0, 8.2, 8.2, 7.8, 8.0]):
             pos = POSITIONS.copy()
-            if index == 3:
+            if index >= 2:
                 pos[1] += [0.08, -0.04, 0.02]
             result = client.calculate(q, positions=pos, consolidated=index % 2 == 0)
-            reference = standalone(tmp_path / f"reference_{index}", basis, q, pos)
+            reference = standalone(
+                tmp_path / f"reference_{index}", basis, q, pos, extra=options
+            )
             error = [
                 abs(result[0] - reference[0]),
                 np.max(np.abs(result[1] - reference[1])),
@@ -555,22 +568,142 @@ def test_workfunction_matches_cube_on_triclinic_cell(tmp_path, basis, axis):
         client.finish()
 
 
-@pytest.mark.parametrize("basis", ["pw", "lcao"])
-def test_ordinary_socket_default_symmetry_and_multiple_positions(tmp_path, basis):
-    inputs(tmp_path / "socket", basis, extra={"symmetry": None})
-    with Client(tmp_path / "socket") as client:
-        client.initialize(cp=False)
-        for index in range(2):
-            positions = POSITIONS.copy()
-            positions[1] += np.array([0.05, -0.03, 0.02]) * index
-            result = client.calculate(positions=positions)
-            reference = standalone(
-                tmp_path / f"reference_{index}", basis, 8.0, positions
+@pytest.mark.parametrize("basis,gamma_only", SOCKET_ADAPTERS)
+@pytest.mark.parametrize("symmetry", [None, 0], ids=["default", "explicit-zero"])
+def test_ordinary_socket_default_symmetry_and_multiple_positions(
+    tmp_path, basis, gamma_only, symmetry
+):
+    assert REFERENCE, "configure an independent ordinary ABACUS reference"
+    moved = POSITIONS.copy()
+    moved[1] += [0.05, -0.03, 0.02]
+    crossed = moved.copy()
+    crossed[0, 0] = CELL[0, 0] - 0.01
+    frames = [POSITIONS, moved, crossed]
+    expected_symmetry = (0 if gamma_only else 1) if symmetry is None else symmetry
+    series = []
+    for name, binary in [("reference", REFERENCE), ("candidate", BINARY)]:
+        directory = tmp_path / name
+        inputs(directory, basis, extra={"symmetry": symmetry, "gamma_only": gamma_only})
+        with Client(directory, binary=binary) as client:
+            client.initialize(cp=False)
+            series.append([client.calculate(positions=pos) for pos in frames])
+            client.finish()
+        resolved = (directory / "OUT.ABACUS/INPUT.info").read_text()
+        assert re.search(rf"^symmetry\s+{expected_symmetry}\s", resolved, re.MULTILINE)
+    for index, (ref, result) in enumerate(zip(*series)):
+        assert abs(result[0] - ref[0]) < 1e-6
+        assert np.max(np.abs(result[1] - ref[1])) < 1e-5
+        assert result[3] == ref[3]
+        if symmetry == 0 and index < 2:
+            static = standalone(
+                tmp_path / f"static_{index}",
+                basis,
+                8.0,
+                frames[index],
+                extra={"gamma_only": gamma_only},
             )
-            assert abs(result[0] - reference[0]) < 1e-6
-            assert np.max(np.abs(result[1] - reference[1])) < 1e-5
-            assert "fermi_level_eV" not in result[3]
-        client.finish()
+            assert abs(result[0] - static[0]) < 1e-6
+            assert np.max(np.abs(result[1] - static[1])) < 1e-5
+
+
+@pytest.mark.parametrize("basis,gamma_only", SOCKET_ADAPTERS)
+def test_oscillation_and_convergence_same_iteration(tmp_path, basis, gamma_only):
+    options = dict(
+        scf_thr=1e-6,
+        scf_os_stop=1,
+        # Start the oscillation check on this fixture's converging iteration.
+        scf_os_ndim=13 if basis == "pw" else 18,
+        scf_os_thr=-10,
+        gamma_only=gamma_only,
+        gate_flag=1,
+        zgate=0.75,
+        efield_flag=1,
+        dip_cor_flag=1,
+        efield_pos_max=0.9,
+        efield_pos_dec=0.1,
+        out_pot=0,
+    )
+    assert REFERENCE, "configure an independent ordinary ABACUS reference"
+    for name, binary in [("reference", REFERENCE), ("candidate", BINARY)]:
+        directory = tmp_path / name
+        static = standalone(
+            directory, basis, 8.0, POSITIONS, extra=options, binary=binary
+        )
+        assert (
+            "#SCF IS CONVERGED#"
+            in (directory / "OUT.ABACUS/running_scf.log").read_text()
+        )
+        assert "Density oscillation is found" in (directory / "abacus.log").read_text()
+        directory = tmp_path / f"{name}_socket"
+        inputs(directory, basis, extra=options)
+        with Client(directory, binary=binary) as client:
+            client.initialize(cp=False)
+            result = client.calculate()
+            assert result[3]["scf_converged"] is True
+            assert abs(result[0] - static[0]) < 1e-6
+            assert np.max(np.abs(result[1] - static[1])) < 1e-5
+            client.finish()
+        assert "Density oscillation is found" in (directory / "abacus.log").read_text()
+    directory = tmp_path / "controlled"
+    inputs(directory, basis, extra=options)
+    with Client(directory) as client:
+        client.initialize()
+        client.connection.sendall(
+            header("CHGDATA")
+            + struct.pack("=di", 8.0, 0)
+            + client.posdata(POSITIONS, CELL)
+            + header("GETFORCE")
+        )
+        # Reject before emitting even a partial success header. A timeout or
+        # termination by fixture cleanup must never count as a valid rejection.
+        try:
+            assert client.connection.recv(12) == b""
+        except ConnectionResetError:
+            pass
+        assert client.process.wait(timeout=30) != 0
+    log = (directory / "abacus.log").read_text()
+    assert "Density oscillation is found" in log
+    assert "SCF did not converge" in log
+
+
+@pytest.mark.parametrize(
+    "bounds,charge,diagnostic",
+    [
+        ((20, 30), None, "outside the cell height"),
+        ((0.010, 0.011), 8.1, "no FFT points"),
+        (None, 7.0, "fractional electron populations"),
+        (None, 8.000000001, "fractional electron populations"),
+        (None, 8.1, "fractional electron populations"),
+    ],
+    ids=["outside-cell", "no-grid-plane", "odd", "near-even", "fractional"],
+)
+def test_invalid_window_or_fixed_occupation_is_rejected_before_scf(
+    tmp_path, bounds, charge, diagnostic
+):
+    options = {"smearing_method": "fixed"} if bounds is None else {}
+    inputs(tmp_path, extra=options)
+    raw = None
+    if bounds is not None:
+        raw = (
+            "NELECT:8,neutral_electrons:8,potential_average_axis:z,"
+            f"potential_average_min_A:{bounds[0]},potential_average_max_A:{bounds[1]}"
+        )
+    with Client(tmp_path) as client:
+        if charge is None:
+            with pytest.raises((EOFError, ConnectionResetError)):
+                client.initialize(raw=raw)
+        else:
+            client.initialize(raw=raw)
+            with pytest.raises((EOFError, ConnectionResetError)):
+                client.calculate(charge)
+        assert client.process.wait(timeout=30) != 0
+    stdout = (tmp_path / "abacus.log").read_text()
+    running = (tmp_path / "OUT.ABACUS/running_scf.log").read_text()
+    assert diagnostic in stdout
+    assert not re.search(r"^\s*CG\d+\s+", stdout, re.MULTILINE)
+    assert "solve_psik" not in running
+    assert "TOTAL-FORCE" not in running
+    assert "Sending extras JSON" not in running
 
 
 @pytest.mark.parametrize("basis", ["pw", "lcao"])
@@ -601,25 +734,16 @@ def test_zero_request_exit(tmp_path, basis):
         "legacy_flag",
         "legacy_flag_three",
         "unconverged",
-        "bad_window",
-        "fixed_fractional",
     ],
 )
 def test_invalid_requests_fail_without_results(tmp_path, failure):
     extra = {"scf_nmax": 1} if failure == "unconverged" else {}
-    if failure == "fixed_fractional":
-        extra["smearing_method"] = "fixed"
     inputs(tmp_path, extra=extra)
     with Client(tmp_path) as client:
         if failure not in ("pos_before_init", "negative_init", "truncated_header"):
-            if failure == "bad_window":
-                client.initialize(
-                    raw="NELECT:8,neutral_electrons:8,potential_average_axis:z,potential_average_min_A:20,potential_average_max_A:30"
-                )
-            else:
-                client.initialize()
-                if failure == "legacy_flag_three":
-                    client.calculate(8.0)
+            client.initialize()
+            if failure == "legacy_flag_three":
+                client.calculate(8.0)
         if failure == "force_before_pos":
             payload = header("GETFORCE")
         elif failure == "pos_before_init" or failure == "missing_charge":
@@ -667,8 +791,6 @@ def test_invalid_requests_fail_without_results(tmp_path, failure):
     text = (tmp_path / "abacus.log").read_text()
     if failure == "unconverged":
         assert "SCF did not converge" in text
-    if failure == "fixed_fractional":
-        assert "fractional electron populations" in text
 
 
 def response_calls(directory):
@@ -816,7 +938,11 @@ def test_ordinary_unconverged_reports_metadata(tmp_path, basis):
 
 @pytest.mark.parametrize(
     "extra,message",
-    [({"cal_force": 0}, "cal_force=1"), ({"cal_stress": 1}, "cal_stress=0")],
+    [
+        ({"cal_force": 0}, "cal_force=1"),
+        ({"cal_stress": 1}, "cal_stress=0"),
+        ({"symmetry": None}, "symmetry=0/-1"),
+    ],
 )
 def test_constant_potential_requires_supported_properties(tmp_path, extra, message):
     inputs(tmp_path, extra=extra)
